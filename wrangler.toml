@@ -1,0 +1,25 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# EdenOS Analytics Worker — wrangler.toml
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# This worker handles BOTH portals.
+# No proxy to tryeden.com — passes through to Vercel (EdenOS app) directly.
+#
+# DEPLOY:
+#   wrangler secret put SEGMENT_WRITE_KEY
+#   wrangler secret put SERVER_API_SECRET
+#   wrangler deploy
+#
+# LOCAL TEST:
+#   wrangler dev --port 8787
+
+name               = "eden-analytics"
+main               = "eden-analytics-worker.js"
+compatibility_date = "2024-09-23"
+
+# Both portals — no tryeden proxy
+routes = [
+  { pattern = "eden.health/*",     zone_name = "eden.health" },
+  { pattern = "www.eden.health/*", zone_name = "eden.health" },
+  { pattern = "app.eden.health/*", zone_name = "eden.health" },
+]
