@@ -2,24 +2,35 @@
 # EdenOS Analytics Worker — wrangler.toml
 # ─────────────────────────────────────────────────────────────────────────────
 #
-# This worker handles BOTH portals.
-# No proxy to tryeden.com — passes through to Vercel (EdenOS app) directly.
-#
-# DEPLOY:
-#   wrangler secret put SEGMENT_WRITE_KEY
-#   wrangler secret put SERVER_API_SECRET
-#   wrangler deploy
+# DEPLOY (one time setup):
+#   1. wrangler kv:namespace create "GCLID_KV"
+#      → copy the id into [[kv_namespaces]] below
+#   2. wrangler secret put SEGMENT_WRITE_KEY
+#   3. wrangler secret put SERVER_API_SECRET   (optional — server auth)
+#   4. wrangler deploy
 #
 # LOCAL TEST:
 #   wrangler dev --port 8787
+#
+# SECRETS (never in this file — set via wrangler secret put):
+#   SEGMENT_WRITE_KEY   → Segment write key for EdenOS source
+#   SERVER_API_SECRET   → Optional — authenticates /server-collect requests
+# ─────────────────────────────────────────────────────────────────────────────
 
 name               = "eden-analytics"
 main               = "eden-analytics-worker.js"
 compatibility_date = "2024-09-23"
 
-# Both portals — no tryeden proxy
+# ── Routes — both portals ─────────────────────────────────────────────────────
 routes = [
   { pattern = "eden.health/*",     zone_name = "eden.health" },
   { pattern = "www.eden.health/*", zone_name = "eden.health" },
   { pattern = "app.eden.health/*", zone_name = "eden.health" },
 ]
+
+# ── KV Namespace — gclid attribution storage ──────────────────────────────────
+# Run: wrangler kv:namespace create "GCLID_KV"
+# Paste the output id below
+[[kv_namespaces]]
+binding = "GCLID_KV"
+id      = "12c53db492b7419d8717d6d23831d186"
