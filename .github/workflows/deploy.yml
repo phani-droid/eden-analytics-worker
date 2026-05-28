@@ -2,34 +2,32 @@
 # EdenOS Analytics Worker — GitHub Actions Deploy
 # ─────────────────────────────────────────────────────────────────────────────
 #
-# WHAT THIS DOES:
-#   Every push to main branch → automatically deploys worker to Cloudflare
-#   Pull requests → runs tests only (no deploy)
-#
 # SECRETS TO ADD IN GITHUB (one time):
 #   Repository → Settings → Secrets and variables → Actions → New repository secret
 #
-#   CLOUDFLARE_API_TOKEN   → from Cloudflare dashboard (see README)
-#   CLOUDFLARE_ACCOUNT_ID  → from Cloudflare dashboard (see README)
-#   SEGMENT_WRITE_KEY      → from Segment > Sources > Eden OS > API Keys
-#   SERVER_API_SECRET      → random string (openssl rand -hex 32)
+#   CLOUDFLARE_API_TOKEN   → from Cloudflare dashboard
+#   CLOUDFLARE_ACCOUNT_ID  → from Cloudflare dashboard
+#
+# NOTE: SEGMENT_WRITE_KEY and SERVER_API_SECRET are stored directly in
+# Cloudflare via "wrangler secret put" — NOT in GitHub secrets.
+# ─────────────────────────────────────────────────────────────────────────────
 
 name: Deploy EdenOS Analytics Worker
 
 on:
   push:
     branches:
-      - main          # deploy on every push to main
+      - main
   pull_request:
     branches:
-      - main          # test only on PRs — no deploy
+      - main
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
     name: Deploy to Cloudflare Workers
-
     steps:
+
       # Step 1 — checkout code
       - name: Checkout code
         uses: actions/checkout@v4
@@ -40,12 +38,6 @@ jobs:
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          secrets: |
-            SEGMENT_WRITE_KEY
-            SERVER_API_SECRET
-        env:
-          SEGMENT_WRITE_KEY: ${{ secrets.SEGMENT_WRITE_KEY }}
-          SERVER_API_SECRET: ${{ secrets.SERVER_API_SECRET }}
 
       # Step 3 — verify deployment
       - name: Verify worker is live
