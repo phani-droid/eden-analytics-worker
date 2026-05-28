@@ -257,7 +257,7 @@ export default {
         return jsonResponse({
           ok:                  true,
           worker:              "eden-analytics",
-          version:             "5.4",
+          version:             "5.5",
           ts:                  nowUTC(),
           kv:                  !!env.GCLID_KV,
           phi_stripping:       "disabled — BAA active — decisions at BQ dbt",
@@ -362,14 +362,19 @@ async function handlePageRequest(request, env, ctx, url) {
   if (isNewVisitor) headers.append("Set-Cookie", buildAnonCookie(anonId, url));
   if (isNewSession) headers.append("Set-Cookie", buildSessionCookie(session, url));
 
-  if (env.SEGMENT_WRITE_KEY) {
-    ctx.waitUntil(
-      firePageEvents(
-        request, env, anonId, session, url,
-        isNewVisitor, isNewSession, clickIds, utms, gpcOptOut
-      ).catch(err => console.error("[eden-analytics] page event error:", err))
-    );
-  }
+  // PAGE EVENTS DISABLED — analytics.js already fires page_viewed via
+  // analytics.page() → /collect → Segment. Worker firing it too = inflation.
+  // first_touch still fires via /collect when attribution is present.
+  // To re-enable: uncomment the block below.
+  //
+  // if (env.SEGMENT_WRITE_KEY) {
+  //   ctx.waitUntil(
+  //     firePageEvents(
+  //       request, env, anonId, session, url,
+  //       isNewVisitor, isNewSession, clickIds, utms, gpcOptOut
+  //     ).catch(err => console.error("[eden-analytics] page event error:", err))
+  //   );
+  // }
 
   return new Response(response.body, {
     status:     response.status,
@@ -411,7 +416,7 @@ async function firePageEvents(
       is_new_visitor:   isNewVisitor,
       is_new_session:   isNewSession,
       gpc_opt_out:      gpcOptOut,
-      pipeline_version: "5.4",
+      pipeline_version: "5.5",
     },
     context:   { campaign: buildCampaignContext(attribution) },
     timestamp: nowUTC(),
@@ -427,7 +432,7 @@ async function firePageEvents(
         page_url:         cleanUrl,
         referrer:         referrer || undefined,
         session_id:       sessionId,
-        pipeline_version: "5.4",
+        pipeline_version: "5.5",
       },
       context:   { campaign: buildCampaignContext(attribution) },
       timestamp: nowUTC(),
@@ -490,7 +495,7 @@ async function handleCollect(request, env, ctx, url) {
     portal,
     source_type:      "client",
     gpc_opt_out:      gpcOptOut,
-    pipeline_version: "5.4",
+    pipeline_version: "5.5",
   };
 
   if (env.SEGMENT_WRITE_KEY) {
@@ -576,7 +581,7 @@ async function handleServerCollect(request, env, ctx) {
   const superProps = {
     portal:           "patient",
     source_type:      "server",
-    pipeline_version: "5.4",
+    pipeline_version: "5.5",
   };
 
   const attribution = storedAttribution || {};
