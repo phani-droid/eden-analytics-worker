@@ -2,35 +2,32 @@
 # EdenOS Analytics Worker — wrangler.toml
 # ─────────────────────────────────────────────────────────────────────────────
 #
-# DEPLOY (one time setup):
-#   1. wrangler kv:namespace create "GCLID_KV"
-#      → copy the id into [[kv_namespaces]] below
-#   2. wrangler secret put SEGMENT_WRITE_KEY
-#   3. wrangler secret put SERVER_API_SECRET   (optional — server auth)
-#   4. wrangler deploy
+# SECRETS (set via wrangler secret put — never store in this file):
+#   SEGMENT_WRITE_KEY   → Segment write key for Eden OS source
+#   SERVER_API_SECRET   → Authenticates /server-collect from HealthOS
 #
 # LOCAL TEST:
 #   wrangler dev --port 8787
 #
-# SECRETS (never in this file — set via wrangler secret put):
-#   SEGMENT_WRITE_KEY   → Segment write key for EdenOS source
-#   SERVER_API_SECRET   → Optional — authenticates /server-collect requests
+# DEPLOY:
+#   wrangler deploy
 # ─────────────────────────────────────────────────────────────────────────────
 
 name               = "eden-analytics"
 main               = "eden-analytics-worker.js"
 compatibility_date = "2024-09-23"
 
-# ── Routes — both portals ─────────────────────────────────────────────────────
+# ── Routes — approved scope only ──────────────────────────────────────────────
+# To add new domain: add route here + add to ALLOWED_ORIGINS in worker → deploy
 routes = [
   { pattern = "eden.health/*",     zone_name = "eden.health" },
   { pattern = "www.eden.health/*", zone_name = "eden.health" },
   { pattern = "app.eden.health/*", zone_name = "eden.health" },
 ]
 
-# ── KV Namespace — gclid attribution storage ──────────────────────────────────
-# Run: wrangler kv:namespace create "GCLID_KV"
-# Paste the output id below
+# ── KV Namespace — attribution storage (120 day TTL) ─────────────────────────
+# Stores gclid + click IDs against anonymousId and userId
+# KV namespace already created — id confirmed from session
 [[kv_namespaces]]
 binding = "GCLID_KV"
 id      = "12c53db492b7419d8717d6d23831d186"

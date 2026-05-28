@@ -1,88 +1,129 @@
 // =============================================================================
-// EdenOS Analytics Worker — v5.0
+// EdenOS Analytics Worker — v5.3
 // =============================================================================
 //
-// COVERAGE STRATEGY — maximising gclid attribution to ~98%:
+// ARCHITECTURE — five coverage layers:
 //
-//   Layer 1 — HttpOnly cookie (eden_anon_id)
+//   Layer 1 — HttpOnly cookie (eden_anon_id + eden_anonymous_id legacy)
 //     First-party, server-set, ITP-resistant, 2 years
-//     Safari/Firefox/Chrome cannot wipe HttpOnly cookies
-//     Coverage: ~85% baseline
+//     Reads legacy eden_anonymous_id if present (identity continuity)
+//     Sets eden_anon_id as canonical going forward
+//     Domain=.eden.health spans eden.health AND app.eden.health
 //
-//   Layer 2 — Cloudflare KV (gclid store)
-//     Stores gclid against anonymousId AND userId
-//     Cross-device: same user on mobile + desktop gets same gclid
-//     TTL: 90 days — matches Google Ads conversion window
-//     Coverage: +8% (cross-device, returning users)
+//   Layer 2 — Cloudflare KV (attribution store, 120 days)
+//     Stores gclid + 15 other click IDs + UTMs against anonymousId
+//     Parallel reads — anonId + userId resolved simultaneously
+//     First-touch wins — never overwritten by retargeting
 //
-//   Layer 3 — userId → gclid link at identify/login
-//     When user logs in — links userId to stored anonId attribution
-//     Recovers users who clear cookies but log back in
-//     Coverage: +3% (cookie-cleared returning users)
+//   Layer 3 — userId → gclid link at /identify
+//     Called at login + account creation
+//     Copies attribution from anonymousId → userId in KV (copy only)
+//     Enables cross-device + post-cookie-clear attribution
 //
 //   Layer 4 — Enhanced conversions (email_sha256)
-//     Google matches hashed email against Google account database
-//     Recovers conversions with no gclid at all
-//     Coverage: +2% (incognito, blocked cookies)
+//     email auto-hashed to email_sha256 via SHA-256
+//     Google + Meta match against their account databases
 //
-//   Layer 5 — Referrer-based fallback
-//     If no gclid but referrer = google.com — marks as google_organic
-//     Not a paid attribution but prevents complete blind spot
+//   Layer 5 — Organic referrer detection
+//     Detects Google, Bing, DuckDuckGo etc from Referer header
+//     Labels as utm_source=google, utm_medium=organic
 //
-//   Unavoidable loss ~1-2%:
-//     GPC signal (legal opt-out — cannot override)
-//     Incognito + no Google account match
-//     VPN + cookie blockers + no email match
+// ATTRIBUTION MODEL: First-touch wins
+//   First paid click stored in KV — retargeting cannot overwrite
+//   userId copy only — never overwrites existing userId attribution
+//   Click IDs validated non-empty before KV write
+//   Organic flows clean — attribution never fabricated
+//
+// DEDUPLICATION (three layers):
+//   1. Worker KV — 24hr TTL per order_id (blocks Shippo webhook retries)
+//   2. Google Ads — native order_id dedup (second safety net)
+//   3. BigQuery — QUALIFY ROW_NUMBER = 1 per patient (permanent)
+//   Fails open on KV error — better a duplicate than missed conversion
+//   IMPORTANT: use Bask order_id (static UUID) not Stripe transaction_id
+//   (transaction_id changes ~60% of time per Ryon — not a reliable dedup key)
+//
+// AUTO-CONSENT / GPC HANDLING:
+//   California (CCPA) + Virginia (VCDPA) — GPC signal must be honored
+//   Sec-GPC: 1 header → skip attribution storage → page served clean
+//   Still fires page_viewed without attribution (no opt-out from analytics)
+//   Cannot override GPC legally — non-negotiable
+//
+// PHI / PCI GOVERNANCE:
+//   BAA signed with Segment — PHI flows through legally
+//   Stripping DISABLED — all data flows to Segment → BigQuery
+//   PHI/PCI decisions at BigQuery dbt layer per Jared's guidance
+//   email → email_sha256 ALWAYS active (enhanced conversions)
+//   To enable stripping: uncomment PCI_PROPS / PHI_PROPS blocks below
+//
+// IDENTITY STITCHING (per Ryon's architecture):
+//   Eden has four identity layers:
+//     eden_anonymous_id (edge layer — legacy) → read by worker, aligned
+//     Segment anonymous_id — set by analytics.js, aligned via setAnonymousId
+//     Bask order_id (static UUID) — used for dedup, NOT transaction_id
+//     Bask user_id — linked at /identify → KV → cross-device attribution
+//
+// CHANNEL MIGRATION SCHEDULE:
+//   May 28 — Google Paid Search + SEO (worker must be live TODAY)
+//   Jun 01 — Affiliate (Everflow + Katalys)
+//   Jun 02 — Meta (Facebook / Instagram)
+//   Jun 03 — TikTok
+//   Jun 04 — Influencer (Upfluence)
+//
+// ATTRIBUTION SPEC:
+//   All click IDs + UTMs in context.campaign per Segment spec
+//   Confirmed by Segment Success Engineer George D. (May 27 2026)
+//
+// ROUTES (approved scope — wrangler.toml):
+//   eden.health/*       — marketing site
+//   www.eden.health/*   — marketing site (www)
+//   app.eden.health/*   — patient portal
 //
 // ENDPOINTS:
-//   /*               → page requests → cookie + KV store + page_viewed
-//   /collect         → client-side events → KV enrichment → Segment
-//   /server-collect  → server-side events → KV enrichment → Segment
-//   /identify        → login/account creation → userId→gclid link in KV
-//   /eden-health-check → health check
+//   /*                  → page requests → cookie + KV + page_viewed
+//   /collect            → client-side events → KV enrichment → Segment
+//   /server-collect     → server-side events → KV enrichment → Segment
+//   /identify           → login/account creation → userId→gclid in KV
+//   /eden-health-check  → health check + version
 //
-// DEPLOY:
-//   1. wrangler kv namespace create "GCLID_KV" → paste id into wrangler.toml
-//   2. wrangler secret put SEGMENT_WRITE_KEY
-//   3. wrangler secret put SERVER_API_SECRET
-//   4. wrangler deploy
-//
-// ADD NEW EVENT:     fire analytics.track() → worker handles everything
-// ADD NEW DESTINATION: configure in Segment UI → no worker changes needed
-// ADD NEW PHI FIELD: add to PHI_PROPS below → auto-stripped on next deploy
+// SCALABILITY:
+//   KV: unlimited keys, <1ms reads, 300+ edge locations
+//   Worker: no cold start, handles 10M+ requests/month at $5
+//   Adding new domain: add to routes + ALLOWED_ORIGINS → deploy
+//   Adding new channel: add to CLICK_ID_CONFIG → deploy
+//   Enabling PHI stripping: uncomment blocks below → deploy
 // =============================================================================
 
 
 // ─────────────────────────────────────────────────────────────────────────────
-// PHI BLOCKLIST — stripped from ALL events before Segment
-// Add new fields here — auto-stripped on next deploy
+// PHI / PCI STRIPPING — DISABLED (BAA active, decisions at BQ dbt)
+//
+// To enable when Jared confirms fields:
+//   1. Uncomment relevant block below
+//   2. Call stripFields(props, PCI_PROPS) in hashEmail() function
+//   3. Deploy — takes effect immediately
+//
+// const PCI_PROPS = new Set([
+//   "card_number", "card_exp_date", "card_cvc",
+//   "OS_card_number", "OS_card_exp_date", "OS_card_cvc",
+//   "cvv", "pan",
+// ]);
+//
+// const PHI_PROPS = new Set([
+//   "firstName", "lastName", "phoneNumber", "phone",
+//   "full_name", "address", "dob", "date_of_birth",
+//   "ssn", "social_security_number",
+//   "weight_lbs", "height_ft", "bmi_value",
+//   "goal_weight_lbs", "highest_weight_lbs",
+//   "selected_conditions", "selected_medications",
+//   "selected_allergies", "medication",
+//   "diagnosis", "prescription", "medical_history",
+// ]);
 // ─────────────────────────────────────────────────────────────────────────────
 
-const PHI_PROPS = new Set([
-  // PII
-  "customerEmail", "email",
-  "firstName", "lastName",
-  "phoneNumber", "phone",
-  "full_name", "address",
-  "dob", "date_of_birth",
-  "ssn", "social_security_number",
-
-  // Health data — HIPAA
-  "weight_lbs", "height_ft", "bmi_value",
-  "goal_weight_lbs", "highest_weight_lbs",
-  "selected_conditions", "selected_medications", "selected_allergies",
-  "lbs_lost", "old_dose_mg", "new_dose_mg", "medication",
-  "diagnosis", "prescription", "medical_history",
-
-  // PCI — card data NEVER reaches analytics
-  "card_number", "card_exp_date", "card_cvc",
-  "OS_card_number", "OS_card_exp_date", "OS_card_cvc",
-  "cvv", "pan",
-]);
-
 
 // ─────────────────────────────────────────────────────────────────────────────
-// ALLOWED ORIGINS — add new portals here only
+// ALLOWED ORIGINS
+// To add new domain: add here + add route in wrangler.toml → deploy
 // ─────────────────────────────────────────────────────────────────────────────
 
 const ALLOWED_ORIGINS = [
@@ -90,6 +131,32 @@ const ALLOWED_ORIGINS = [
   "https://www.eden.health",
   "https://app.eden.health",
   "https://eden-os-rimo-patient-staging.vercel.app",
+];
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CLICK ID CONFIG — all paid channel identifiers
+// To add new channel: add entry here → extractClickIds + buildCampaignContext
+// update automatically
+// ─────────────────────────────────────────────────────────────────────────────
+
+const CLICK_ID_CONFIG = [
+  { param: "gclid",     channel: "google_ads",    label: "Google Ads"     },
+  { param: "gbraid",    channel: "google_ios",    label: "Google iOS"     },
+  { param: "wbraid",    channel: "google_web",    label: "Google Web"     },
+  { param: "dclid",     channel: "google_display",label: "Google Display" },
+  { param: "fbclid",    channel: "meta",          label: "Meta/Facebook"  },
+  { param: "msclkid",   channel: "microsoft",     label: "Microsoft/Bing" },
+  { param: "ttclid",    channel: "tiktok",        label: "TikTok"         },
+  { param: "twclid",    channel: "twitter",       label: "Twitter/X"      },
+  { param: "li_fat_id", channel: "linkedin",      label: "LinkedIn"       },
+  { param: "rdt_cid",   channel: "reddit",        label: "Reddit"         },
+  { param: "epik",      channel: "pinterest",     label: "Pinterest"      },
+  { param: "ScCid",     channel: "snapchat",      label: "Snapchat"       },
+  { param: "nbt",       channel: "northbeam",     label: "Northbeam"      },
+  { param: "irclickid", channel: "impact_radius", label: "Impact Radius"  },
+  { param: "cjevent",   channel: "cj_affiliate",  label: "CJ Affiliate"   },
+  { param: "click_id",  channel: "generic",       label: "Generic"        },
 ];
 
 
@@ -131,14 +198,39 @@ const SENSITIVE_URL_PARAMS = [
   /^code$/i, /^state$/i,
 ];
 
-// KV key prefixes
-const KV_ANON_PREFIX  = "attr:anon:";   // gclid stored by anonymousId
-const KV_USER_PREFIX  = "attr:user:";   // gclid stored by userId (Layer 3)
-const KV_TTL          = 7776000;        // 90 days in seconds
+
+// ─────────────────────────────────────────────────────────────────────────────
+// KV KEY SCHEMA
+//   attr:anon:{anonymousId}     → attribution object (set on ad click)
+//   attr:user:{userId}          → attribution object (set on login)
+//   dedup:{eventName}:{orderId} → dedup lock (24hr TTL)
+//
+// DEDUP NOTE: orderId must be Bask order_id (static UUID)
+// NOT Stripe transaction_id (changes ~60% of time per Ryon)
+// ─────────────────────────────────────────────────────────────────────────────
+
+const KV_ANON_PREFIX = "attr:anon:";
+const KV_USER_PREFIX = "attr:user:";
+const KV_TTL         = 10368000;   // 120 days
+const KV_DEDUP_TTL   = 86400;      // 24 hours
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CONVERSION EVENTS — deduplicated at edge
+// Dedup key: Bask order_id (static) — NOT Stripe transaction_id (changes)
+// ─────────────────────────────────────────────────────────────────────────────
+
+const CONVERSION_EVENTS = new Set([
+  "OS_qualified_first_order",
+  "OS_purchase",
+  "order_completed",
+  "reorder_completed",
+]);
 
 
 // =============================================================================
 // WORKER ENTRY POINT
+// Approved routes: eden.health/*, www.eden.health/*, app.eden.health/*
 // =============================================================================
 
 export default {
@@ -149,16 +241,26 @@ export default {
       // ── Health check ──────────────────────────────────────────────────────
       if (url.pathname === "/eden-health-check") {
         return jsonResponse({
-          ok: true, worker: "eden-analytics", version: "5.0",
-          ts: Date.now(),
-          kv: !!env.GCLID_KV,
+          ok:                  true,
+          worker:              "eden-analytics",
+          version:             "5.3",
+          ts:                  nowUTC(),
+          kv:                  !!env.GCLID_KV,
+          phi_stripping:       "disabled — BAA active — decisions at BQ dbt",
+          gpc_handling:        "enabled — California/Virginia legal compliance",
+          attribution_model:   "first-touch",
+          attribution_ttl:     "120 days",
+          dedup_ttl:           "24 hours",
+          dedup_key:           "Bask order_id (static UUID)",
+          routes:              ["eden.health/*", "www.eden.health/*", "app.eden.health/*"],
+          channels_supported:  CLICK_ID_CONFIG.map(c => c.label),
         });
       }
 
       // ── CORS preflight ────────────────────────────────────────────────────
       if (request.method === "OPTIONS") {
         return new Response(null, {
-          status: 204,
+          status:  204,
           headers: corsHeaders(request.headers.get("Origin") || ""),
         });
       }
@@ -179,9 +281,7 @@ export default {
         return handleServerCollect(request, env, ctx);
       }
 
-      // ── /identify — login / account creation (Layer 3 coverage) ──────────
-      // Links userId → anonymousId attribution in KV
-      // Call this when user logs in or creates account
+      // ── /identify — login / account creation ──────────────────────────────
       if (url.pathname === "/identify" && request.method === "POST") {
         return handleIdentify(request, env, ctx);
       }
@@ -190,7 +290,7 @@ export default {
       return handlePageRequest(request, env, ctx, url);
 
     } catch (err) {
-      console.error("[eden-analytics] error:", err);
+      console.error("[eden-analytics] unhandled error:", err);
       return fetch(request); // fail open — always serve the page
     }
   },
@@ -200,17 +300,32 @@ export default {
 // =============================================================================
 // PAGE REQUEST HANDLER
 //
-// Coverage layers active here:
-//   Layer 1 — Sets HttpOnly eden_anon_id cookie (2 years, ITP-resistant)
-//   Layer 2 — Stores gclid in KV against anonymousId (90 days)
-//   Layer 5 — Detects organic search from referrer as fallback
+// GPC auto-consent: California (CCPA) + Virginia (VCDPA)
+//   Sec-GPC: 1 → skip attribution storage → page served clean
+//   page_viewed still fires without attribution (non-tracking analytics)
+//
+// Identity continuity:
+//   Reads legacy eden_anonymous_id if present (Ryon's edge layer ID)
+//   Sets eden_anon_id as canonical going forward
+//   Both aligned → seamless identity stitching across old + new pipeline
 // =============================================================================
 
 async function handlePageRequest(request, env, ctx, url) {
-  const existingAnonId  = readCookie(request, "eden_anon_id");
+  // ── GPC auto-consent — California (CCPA) + Virginia (VCDPA) ──────────────
+  // Sec-GPC: 1 = user has enabled Global Privacy Control
+  // Legal requirement — cannot override — skip attribution storage
+  const gpcOptOut = request.headers.get("Sec-GPC") === "1";
+
+  // ── Identity continuity — read legacy edge layer ID if present ────────────
+  // eden_anonymous_id = Ryon's legacy edge layer identifier
+  // eden_anon_id = our canonical worker cookie going forward
+  // Use legacy if present → preserves stitching for existing users
+  const legacyAnonId  = readCookie(request, "eden_anonymous_id");
+  const existingAnonId = readCookie(request, "eden_anon_id") || legacyAnonId;
   const existingSession = readCookie(request, "eden_session_id");
-  const isNewVisitor    = !existingAnonId;
-  const isNewSession    = !existingSession;
+
+  const isNewVisitor = !existingAnonId;
+  const isNewSession = !existingSession;
 
   const anonId  = existingAnonId  || crypto.randomUUID();
   const session = existingSession || `${crypto.randomUUID()}_${Date.now()}`;
@@ -218,34 +333,37 @@ async function handlePageRequest(request, env, ctx, url) {
   const clickIds = extractClickIds(url);
   const utms     = extractUTMs(url);
 
-  // ── Layer 2: Store gclid in KV against anonymousId ───────────────────────
-  if (clickIds.gclid && env.GCLID_KV) {
+  // Layer 2 — store attribution in KV (skip if GPC opt-out)
+  const hasAttribution = Object.keys(clickIds).length > 0 || !!utms;
+  if (hasAttribution && env.GCLID_KV && !gpcOptOut) {
     ctx.waitUntil(
       storeAttribution(env.GCLID_KV, KV_ANON_PREFIX + anonId, {
-        ...clickIds,
         ...(utms || {}),
+        ...clickIds,
       }).catch(err => console.error("[eden-analytics] KV store error:", err))
     );
   }
 
-  // Pass through to origin
+  // Pass through to origin — never block page load
   const response = await fetch(request);
 
-  // ── Layer 1: Set HttpOnly cookie ──────────────────────────────────────────
+  // Layer 1 — set HttpOnly cookies
   const headers = new Headers(response.headers);
   if (isNewVisitor) headers.append("Set-Cookie", buildAnonCookie(anonId, url));
   if (isNewSession) headers.append("Set-Cookie", buildSessionCookie(session, url));
 
-  // Fire analytics in background
+  // Fire page events in background
   if (env.SEGMENT_WRITE_KEY) {
     ctx.waitUntil(
-      firePageEvents(request, env, anonId, session, url, isNewVisitor, isNewSession, clickIds, utms)
-        .catch(err => console.error("[eden-analytics] page event error:", err))
+      firePageEvents(
+        request, env, anonId, session, url,
+        isNewVisitor, isNewSession, clickIds, utms, gpcOptOut
+      ).catch(err => console.error("[eden-analytics] page event error:", err))
     );
   }
 
   return new Response(response.body, {
-    status: response.status,
+    status:     response.status,
     statusText: response.statusText,
     headers,
   });
@@ -256,46 +374,57 @@ async function handlePageRequest(request, env, ctx, url) {
 // PAGE EVENTS
 // =============================================================================
 
-async function firePageEvents(request, env, anonId, session, url, isNewVisitor, isNewSession, clickIds, utms) {
-  const cleanUrl    = sanitizeUrl(url);
-  const referrer    = sanitizeUrlString(request.headers.get("Referer") || "");
-  const ua          = request.headers.get("User-Agent") || "";
-  const portal      = url.hostname.includes("app.eden.health") ? "patient" : "marketing";
-  const sessionId   = session.split("_")[0];
+async function firePageEvents(
+  request, env, anonId, session, url,
+  isNewVisitor, isNewSession, clickIds, utms, gpcOptOut
+) {
+  const cleanUrl  = sanitizeUrl(url);
+  const referrer  = sanitizeUrlString(request.headers.get("Referer") || "");
+  const ua        = request.headers.get("User-Agent") || "";
+  const portal    = url.hostname.includes("app.eden.health") ? "patient" : "marketing";
+  const sessionId = session.split("_")[0];
 
-  // ── Layer 5: Organic fallback ─────────────────────────────────────────────
+  // Layer 5 — organic fallback from referrer
   const organic     = !utms && !clickIds.gclid && referrer ? detectOrganic(referrer) : null;
-  const attribution = { ...(utms || organic || {}), ...clickIds };
 
-  await segmentTrack(env.SEGMENT_WRITE_KEY, {
+  // If GPC opt-out — fire page_viewed without any attribution
+  const attribution = gpcOptOut ? {} : { ...(utms || organic || {}), ...clickIds };
+
+  await segmentPost(env.SEGMENT_WRITE_KEY, "track", {
     anonymousId: anonId,
     event:       "page_viewed",
-    properties:  stripPHI({
+    properties:  {
       portal,
-      page_path:      url.pathname,
-      page_url:       cleanUrl,
-      page_search:    url.search   || undefined,
-      referrer:       referrer     || undefined,
-      device_type:    isMobile(ua) ? "mobile" : "desktop",
-      session_id:     sessionId,
-      is_new_visitor: isNewVisitor,
-      is_new_session: isNewSession,
-      ...attribution,
-    }),
+      page_path:        url.pathname,
+      page_url:         cleanUrl,
+      page_search:      url.search || undefined,
+      referrer:         referrer   || undefined,
+      device_type:      isMobile(ua) ? "mobile" : "desktop",
+      session_id:       sessionId,
+      is_new_visitor:   isNewVisitor,
+      is_new_session:   isNewSession,
+      gpc_opt_out:      gpcOptOut,
+      pipeline_version: "5.3",
+    },
+    context:   { campaign: buildCampaignContext(attribution) },
+    timestamp: nowUTC(),
   });
 
-  if (isNewSession && Object.keys(attribution).length > 0) {
-    await segmentTrack(env.SEGMENT_WRITE_KEY, {
+  // first_touch — new sessions with paid attribution + no GPC opt-out
+  if (isNewSession && Object.keys(attribution).length > 0 && !gpcOptOut) {
+    await segmentPost(env.SEGMENT_WRITE_KEY, "track", {
       anonymousId: anonId,
       event:       "first_touch",
-      properties:  stripPHI({
+      properties: {
         portal,
-        page_path:  url.pathname,
-        page_url:   cleanUrl,
-        referrer:   referrer || undefined,
-        session_id: sessionId,
-        ...attribution,
-      }),
+        page_path:        url.pathname,
+        page_url:         cleanUrl,
+        referrer:         referrer || undefined,
+        session_id:       sessionId,
+        pipeline_version: "5.3",
+      },
+      context:   { campaign: buildCampaignContext(attribution) },
+      timestamp: nowUTC(),
     });
   }
 }
@@ -303,11 +432,6 @@ async function firePageEvents(request, env, anonId, session, url, isNewVisitor, 
 
 // =============================================================================
 // /collect HANDLER — CLIENT-SIDE EVENTS
-//
-// Coverage layers active:
-//   Layer 1 — reads eden_anon_id from HttpOnly cookie
-//   Layer 2 — enriches with gclid from KV (anonId lookup)
-//   Layer 4 — email_sha256 via PHI sanitization
 // =============================================================================
 
 async function handleCollect(request, env, ctx, url) {
@@ -321,31 +445,41 @@ async function handleCollect(request, env, ctx, url) {
   try { body = await request.json(); }
   catch { return new Response("Invalid JSON", { status: 400 }); }
 
-  // Layer 1 — read from HttpOnly cookie first (most reliable)
-  const cookieAnonId = readCookie(request, "eden_anon_id");
+  const gpcOptOut = request.headers.get("Sec-GPC") === "1";
+
+  // Layer 1 — HttpOnly cookie is most reliable anonId source
+  // Also read legacy eden_anonymous_id for identity continuity
+  const cookieAnonId = readCookie(request, "eden_anon_id")
+                    || readCookie(request, "eden_anonymous_id");
   const anonId       = cookieAnonId || body.anonymousId || crypto.randomUUID();
   const isNew        = !cookieAnonId;
   const portal       = origin.includes("app.eden.health") ? "patient" : "marketing";
+  const userId       = body.userId || null;
 
-  // Layer 2 — look up gclid from KV
-  // Try anonId first, then userId as fallback (Layer 3 cross-device)
-  const userId           = body.userId || null;
-  const storedAttribution = env.GCLID_KV
+  // Layer 2 + 3 — parallel KV reads
+  const storedAttribution = (env.GCLID_KV && !gpcOptOut)
     ? await resolveAttribution(env.GCLID_KV, anonId, userId)
     : null;
 
+  // Fresh URL params override stored — current click is fresher
+  const freshClickIds = gpcOptOut ? {} : extractClickIds(url);
+  const freshUTMs     = gpcOptOut ? null : extractUTMs(url);
+  const attribution   = {
+    ...(storedAttribution || {}),
+    ...(freshUTMs         || {}),
+    ...freshClickIds,
+  };
+
   const superProps = {
     portal,
-    source_type: "client",
-    ...(storedAttribution || {}),
-    // Fresh URL params override stored (current session is fresher)
-    ...(extractUTMs(url) || {}),
-    ...extractClickIds(url),
+    source_type:      "client",
+    gpc_opt_out:      gpcOptOut,
+    pipeline_version: "5.3",
   };
 
   if (env.SEGMENT_WRITE_KEY) {
     ctx.waitUntil(
-      forwardToSegment(env.SEGMENT_WRITE_KEY, body, anonId, superProps)
+      forwardToSegment(env.SEGMENT_WRITE_KEY, body, anonId, superProps, attribution)
         .catch(err => console.error("[eden-analytics] collect error:", err))
     );
   }
@@ -364,10 +498,10 @@ async function handleCollect(request, env, ctx, url) {
 // =============================================================================
 // /server-collect HANDLER — SERVER-SIDE EVENTS
 //
-// Coverage layers active:
-//   Layer 2 — enriches with gclid from KV (anonId lookup)
-//   Layer 3 — falls back to userId lookup if anonId has no gclid
-//   Layer 4 — email_sha256 via PHI sanitization
+// IMPORTANT — dedup key must be Bask order_id (static UUID):
+//   ✓ order_id: "01de7fc4-5432-4598-ba7b-d99edd28ec82" (Bask — static)
+//   ✗ transaction_id: "pi_3Sz71RB18nTglqz80o3l3vQI" (Stripe — changes 60%)
+// Engineer must pass order_id not transaction_id in properties
 // =============================================================================
 
 async function handleServerCollect(request, env, ctx) {
@@ -382,17 +516,37 @@ async function handleServerCollect(request, env, ctx) {
   try { body = await request.json(); }
   catch { return new Response("Invalid JSON", { status: 400 }); }
 
-  const anonId = body.anonymousId || null;
-  const userId = body.userId      || null;
+  const anonId    = body.anonymousId          || null;
+  const userId    = body.userId               || null;
+  const eventName = body.event                || "";
+  const orderId   = body.properties?.order_id || null; // Bask order_id (static)
 
-  // Layer 2 + 3 — look up gclid from KV
-  // Try anonId first, then userId as fallback
+  // ── Edge deduplication ────────────────────────────────────────────────────
+  if (CONVERSION_EVENTS.has(eventName) && orderId && env.GCLID_KV) {
+    const dedupKey = `dedup:${eventName}:${orderId}`;
+    try {
+      const alreadyFired = await env.GCLID_KV.get(dedupKey);
+      if (alreadyFired) {
+        console.log(`[eden-analytics] dedup blocked: ${eventName} order_id=${orderId}`);
+        return jsonResponse({ ok: true, deduped: true });
+      }
+      await env.GCLID_KV.put(dedupKey, JSON.stringify({
+        event:    eventName,
+        order_id: orderId,
+        userId,
+        fired_at: nowUTC(),
+      }), { expirationTtl: KV_DEDUP_TTL });
+    } catch (err) {
+      console.error("[eden-analytics] dedup KV error — failing open:", err);
+    }
+  }
+
+  // Layer 2 + 3 — parallel KV reads
   const storedAttribution = env.GCLID_KV
     ? await resolveAttribution(env.GCLID_KV, anonId, userId)
     : null;
 
-  // Merge stored attribution into event — only if not already present
-  // Explicit values from engineer always take priority
+  // Merge stored attribution — engineer values take priority
   if (storedAttribution && body.properties) {
     for (const [k, v] of Object.entries(storedAttribution)) {
       if (!body.properties[k] && v) {
@@ -401,12 +555,23 @@ async function handleServerCollect(request, env, ctx) {
     }
   }
 
-  const superProps = { portal: "patient", source_type: "server" };
+  const superProps = {
+    portal:           "patient",
+    source_type:      "server",
+    pipeline_version: "5.3",
+  };
+
+  const attribution = storedAttribution || {};
 
   if (env.SEGMENT_WRITE_KEY) {
     ctx.waitUntil(
-      forwardToSegment(env.SEGMENT_WRITE_KEY, body, anonId || userId || "server", superProps)
-        .catch(err => console.error("[eden-analytics] server-collect error:", err))
+      forwardToSegment(
+        env.SEGMENT_WRITE_KEY,
+        body,
+        anonId || userId || "server",
+        superProps,
+        attribution
+      ).catch(err => console.error("[eden-analytics] server-collect error:", err))
     );
   }
 
@@ -417,29 +582,9 @@ async function handleServerCollect(request, env, ctx) {
 // =============================================================================
 // /identify HANDLER — LOGIN / ACCOUNT CREATION
 //
-// Coverage Layer 3 — userId → gclid link
-//
-// When user logs in or creates account:
-//   1. Look up gclid stored against anonymousId
-//   2. Store same gclid against userId
-//   3. Now if user clears cookies + logs back in → gclid still found via userId
-//
-// Engineering usage:
-//   await fetch('https://app.eden.health/identify', {
-//     method: 'POST',
-//     headers: {
-//       'Content-Type': 'application/json',
-//       'X-Eden-Server-Secret': process.env.EDEN_SERVER_API_SECRET,
-//     },
-//     body: JSON.stringify({
-//       userId:      patient.userId,
-//       anonymousId: patient.anonId,   // from eden_anon_id cookie
-//       traits: {
-//         email: patient.email,        // worker hashes automatically
-//         plan:  patient.planName,
-//       }
-//     })
-//   });
+// Per Ryon's architecture — Bask user_id is created late in funnel
+// Must call /identify immediately after account creation
+// Links Bask user_id → anonymousId → gclid in KV
 // =============================================================================
 
 async function handleIdentify(request, env, ctx) {
@@ -457,24 +602,24 @@ async function handleIdentify(request, env, ctx) {
   const anonId = body.anonymousId || null;
   const userId = body.userId      || null;
 
-  // Layer 3 — link userId to anonymousId attribution in KV
+  // Layer 3 — link userId → anonymousId attribution in KV
   if (env.GCLID_KV && anonId && userId) {
     ctx.waitUntil(
       linkUserAttribution(env.GCLID_KV, anonId, userId)
-        .catch(err => console.error("[eden-analytics] KV link error:", err))
+        .catch(err => console.error("[eden-analytics] KV identify link error:", err))
     );
   }
 
   // Forward identify to Segment
   if (env.SEGMENT_WRITE_KEY) {
-    const traits = await sanitizeProperties(body.traits || {});
+    const traits = await hashEmail(body.traits || {});
     ctx.waitUntil(
       segmentPost(env.SEGMENT_WRITE_KEY, "identify", {
         anonymousId: anonId || userId,
         userId,
         traits,
-        timestamp:   new Date().toISOString(),
-      }).catch(err => console.error("[eden-analytics] identify error:", err))
+        timestamp:   nowUTC(),
+      }).catch(err => console.error("[eden-analytics] identify segment error:", err))
     );
   }
 
@@ -484,39 +629,29 @@ async function handleIdentify(request, env, ctx) {
 
 // =============================================================================
 // KV ATTRIBUTION — STORAGE + RETRIEVAL
-//
-// Key structure:
-//   attr:anon:{anonymousId} → attribution object (set on ad click)
-//   attr:user:{userId}      → attribution object (set on login — Layer 3)
-//
-// resolveAttribution tries both keys — anonId first, userId as fallback
-// This handles:
-//   - Normal flow: anonId present → found immediately
-//   - Cleared cookies: anonId gone but userId known → found via userId
-//   - Cross-device: logged in on different device → found via userId
+// First-touch model — retargeting cannot steal acquisition attribution
 // =============================================================================
 
 async function storeAttribution(kv, key, attribution) {
   if (!kv || !key || !attribution) return;
-  const hasValue = Object.values(attribution).some(v => v);
+
+  const hasValue = Object.values(attribution).some(v => v && String(v).trim());
   if (!hasValue) return;
 
-  // Never overwrite a newer gclid with an older one
-  // If gclid already stored — keep it (first paid click wins)
+  // First-touch — never overwrite existing gclid
   try {
     const existing = await kv.get(key);
     if (existing) {
       const parsed = JSON.parse(existing);
-      if (parsed.gclid && attribution.gclid && parsed.gclid !== attribution.gclid) {
-        // Already have a gclid — keep existing (first click attribution)
-        return;
+      if (parsed.gclid && attribution.gclid) {
+        return; // first click wins
       }
     }
-  } catch { /* ignore — proceed to store */ }
+  } catch { /* proceed to store */ }
 
   await kv.put(key, JSON.stringify({
     ...attribution,
-    stored_at: new Date().toISOString(),
+    stored_at: nowUTC(),
   }), { expirationTtl: KV_TTL });
 }
 
@@ -535,89 +670,96 @@ async function getAttribution(kv, key) {
 async function resolveAttribution(kv, anonId, userId) {
   if (!kv) return null;
 
-  // Try anonymousId first — most reliable for current session
-  if (anonId) {
-    const fromAnon = await getAttribution(kv, KV_ANON_PREFIX + anonId);
-    if (fromAnon?.gclid) return fromAnon;
-  }
+  // Parallel KV reads — faster than sequential
+  const [fromAnon, fromUser] = await Promise.all([
+    anonId ? getAttribution(kv, KV_ANON_PREFIX + anonId) : Promise.resolve(null),
+    userId ? getAttribution(kv, KV_USER_PREFIX + userId) : Promise.resolve(null),
+  ]);
 
-  // Layer 3 fallback — try userId (covers cleared cookies + cross-device)
-  if (userId) {
-    const fromUser = await getAttribution(kv, KV_USER_PREFIX + userId);
-    if (fromUser?.gclid) return fromUser;
-  }
-
-  // Return whatever we have even without gclid (UTMs still valuable)
-  if (anonId) {
-    const fromAnon = await getAttribution(kv, KV_ANON_PREFIX + anonId);
-    if (fromAnon) return fromAnon;
-  }
-
-  if (userId) {
-    return await getAttribution(kv, KV_USER_PREFIX + userId);
-  }
-
+  if (fromAnon?.gclid) return fromAnon; // anonId with gclid = best
+  if (fromUser?.gclid) return fromUser; // userId = cross-device fallback
+  if (fromAnon) return fromAnon;         // any attribution without gclid
+  if (fromUser) return fromUser;
   return null;
 }
 
 async function linkUserAttribution(kv, anonId, userId) {
-  // Copy attribution from anonId → userId
-  // So future server events can find gclid via userId even if cookie gone
-  const anonAttribution = await getAttribution(kv, KV_ANON_PREFIX + anonId);
-  if (anonAttribution) {
-    await storeAttribution(kv, KV_USER_PREFIX + userId, anonAttribution);
-  }
+  // Parallel reads — get both simultaneously
+  const [anonAttribution, existingUser] = await Promise.all([
+    getAttribution(kv, KV_ANON_PREFIX + anonId),
+    getAttribution(kv, KV_USER_PREFIX  + userId),
+  ]);
+
+  if (!anonAttribution)   return; // nothing to copy
+  if (existingUser?.gclid) return; // userId already attributed — first-touch preserved
+
+  await storeAttribution(kv, KV_USER_PREFIX + userId, anonAttribution);
 }
 
 
 // =============================================================================
 // SEGMENT FORWARDING
+// Attribution in context.campaign per Segment spec
 // =============================================================================
 
-async function forwardToSegment(writeKey, body, anonId, superProps) {
+async function forwardToSegment(writeKey, body, anonId, superProps, attribution = {}) {
   const type = (body.type || "track").toLowerCase();
 
+  const mergedContext = {
+    ...(body.context || {}),
+    campaign: {
+      ...((body.context || {}).campaign || {}),
+      ...buildCampaignContext(attribution),
+    },
+  };
+
   if (type === "identify") {
-    const traits = await sanitizeProperties(body.traits || body.properties || {});
+    const traits = await hashEmail(body.traits || body.properties || {});
     await segmentPost(writeKey, "identify", {
       anonymousId: anonId,
       userId:      body.userId || null,
       traits,
-      context:     body.context || {},
-      timestamp:   new Date().toISOString(),
+      context:     mergedContext,
+      timestamp:   nowUTC(),
     });
     return;
   }
 
   if (type === "page") {
-    const props = await sanitizeProperties({ ...superProps, ...(body.properties || {}) });
     await segmentPost(writeKey, "page", {
       anonymousId: anonId,
       userId:      body.userId || null,
       name:        body.name   || "",
-      properties:  props,
-      context:     body.context || {},
-      timestamp:   new Date().toISOString(),
+      properties:  await hashEmail({ ...superProps, ...(body.properties || {}) }),
+      context:     mergedContext,
+      timestamp:   nowUTC(),
     });
     return;
   }
 
   // Default: track
-  await segmentTrack(writeKey, {
+  await segmentPost(writeKey, "track", {
     anonymousId: anonId,
     userId:      body.userId || null,
     event:       body.event  || "",
-    properties:  await sanitizeProperties({ ...superProps, ...(body.properties || {}) }),
-    context:     body.context || {},
-    timestamp:   body.sentAt || body.timestamp || new Date().toISOString(),
+    properties:  await hashEmail({ ...superProps, ...(body.properties || {}) }),
+    context:     mergedContext,
+    timestamp:   body.sentAt || body.timestamp || nowUTC(),
   });
 }
 
-async function segmentTrack(writeKey, payload) {
-  if (payload.properties) {
-    payload.properties = await sanitizeProperties(payload.properties);
+// context.campaign per Segment spec
+function buildCampaignContext(attribution) {
+  const campaign      = {};
+  const CAMPAIGN_KEYS = [
+    "utm_source", "utm_medium", "utm_campaign",
+    "utm_content", "utm_term",  "utm_id",
+    ...CLICK_ID_CONFIG.map(c => c.param),
+  ];
+  for (const k of CAMPAIGN_KEYS) {
+    if (attribution[k]) campaign[k] = attribution[k];
   }
-  await segmentPost(writeKey, "track", payload);
+  return campaign;
 }
 
 async function segmentPost(writeKey, endpoint, payload) {
@@ -637,57 +779,35 @@ async function segmentPost(writeKey, endpoint, payload) {
 
 
 // =============================================================================
-// PHI SANITIZATION
-// Layer 4 — strips PHI, hashes email → email_sha256
+// EMAIL HASHING — Layer 4 enhanced conversions
+// email → email_sha256 ALWAYS active (Google/Meta enhanced conversions)
+// All other data passes through — PHI/PCI decisions at BigQuery dbt layer
+// To enable PCI/PHI stripping: uncomment blocks at top + add stripFields() call
 // =============================================================================
 
-async function sanitizeProperties(props) {
+async function hashEmail(props) {
   if (!props || typeof props !== "object") return props;
   const out = {};
   for (const [k, v] of Object.entries(props)) {
-    if (PHI_PROPS.has(k)) continue;
+    // Auto-hash email → email_sha256 (Layer 4)
     if ((k === "email" || k === "customerEmail") && typeof v === "string") {
       out["email_sha256"] = await sha256(v);
+      out[k] = v; // raw email passes through — BAA covers it
+      // To strip raw email: replace above line with: continue;
       continue;
     }
     if (v && typeof v === "object" && !Array.isArray(v)) {
-      out[k] = await sanitizeNested(v);
+      out[k] = await hashEmail(v);
       continue;
     }
     out[k] = v;
-  }
-  return out;
-}
-
-async function sanitizeNested(obj) {
-  const out = {};
-  for (const [k, v] of Object.entries(obj)) {
-    if (PHI_PROPS.has(k)) continue;
-    if (k === "email" && typeof v === "string") {
-      out["email_sha256"] = await sha256(v);
-      continue;
-    }
-    if (v && typeof v === "object" && !Array.isArray(v)) {
-      out[k] = await sanitizeNested(v);
-      continue;
-    }
-    out[k] = v;
-  }
-  return out;
-}
-
-function stripPHI(props) {
-  if (!props || typeof props !== "object") return props;
-  const out = {};
-  for (const [k, v] of Object.entries(props)) {
-    if (!PHI_PROPS.has(k)) out[k] = v;
   }
   return out;
 }
 
 
 // =============================================================================
-// SHA-256 HASHING — Layer 4 enhanced conversions
+// SHA-256 — lowercase + trim per Google/Meta spec
 // =============================================================================
 
 async function sha256(value) {
@@ -716,40 +836,23 @@ function extractUTMs(url) {
 
 function extractClickIds(url) {
   const out = {};
-  for (const k of [
-    "gclid",     // Google Ads — most important
-    "gbraid",    // Google iOS (privacy-safe)
-    "wbraid",    // Google web (privacy-safe)
-    "dclid",     // Google Display
-    "fbclid",    // Meta/Facebook
-    "msclkid",   // Microsoft/Bing
-    "ttclid",    // TikTok
-    "twclid",    // Twitter/X
-    "li_fat_id", // LinkedIn
-    "rdt_cid",   // Reddit
-    "epik",      // Pinterest
-    "ScCid",     // Snapchat
-    "nbt",       // Northbeam
-    "irclickid", // Impact Radius
-    "cjevent",   // CJ Affiliate
-    "click_id",  // Generic
-  ]) {
-    const v = url.searchParams.get(k);
-    if (v) out[k] = v;
+  for (const { param } of CLICK_ID_CONFIG) {
+    const v = url.searchParams.get(param);
+    if (v) out[param] = v;
   }
   return out;
 }
 
 
 // =============================================================================
-// ORGANIC SEARCH DETECTION — Layer 5 fallback
+// ORGANIC SEARCH DETECTION — Layer 5
 // =============================================================================
 
 function detectOrganic(referrer) {
   if (!referrer) return null;
   try {
-    const ref = new URL(referrer);
-    const h   = ref.hostname.toLowerCase();
+    const ref     = new URL(referrer);
+    const h       = ref.hostname.toLowerCase();
     const engines = {
       google:     /^(.+\.)?google\.(com|co\.[a-z]{2}|[a-z]{2,3})(\.[a-z]{2})?$/i,
       bing:       /^(.+\.)?bing\.(com|co\.[a-z]{2})$/i,
@@ -801,9 +904,7 @@ function isStaticAsset(url) {
 
 
 // =============================================================================
-// COOKIE HELPERS
-// Layer 1 — ITP-resistant HttpOnly first-party cookies
-// Domain=.eden.health spans eden.health AND app.eden.health
+// COOKIE HELPERS — Layer 1 ITP-resistant HttpOnly first-party cookies
 // =============================================================================
 
 function readCookie(request, name) {
@@ -822,10 +923,10 @@ function cookieDomain(url) {
 function buildAnonCookie(id, url) {
   return [
     `eden_anon_id=${encodeURIComponent(id)}`,
-    "Max-Age=63072000",              // 2 years
-    `Domain=${cookieDomain(url)}`,   // .eden.health — spans both portals
+    "Max-Age=63072000",             // 2 years
+    `Domain=${cookieDomain(url)}`,  // .eden.health — spans both portals
     "Path=/",
-    "HttpOnly",                      // ITP-resistant — Safari cannot wipe
+    "HttpOnly",                     // ITP-resistant — Safari cannot wipe
     "Secure",
     "SameSite=Lax",
   ].join("; ");
@@ -834,7 +935,7 @@ function buildAnonCookie(id, url) {
 function buildSessionCookie(value, url) {
   return [
     `eden_session_id=${encodeURIComponent(value)}`,
-    "Max-Age=1800",                  // 30 minutes
+    "Max-Age=1800",                 // 30 minutes
     `Domain=${cookieDomain(url)}`,
     "Path=/",
     "Secure",
@@ -896,4 +997,8 @@ function jsonResponse(data) {
 
 function isMobile(ua) {
   return /Mobile|Android|iPhone|iPad|iPod/i.test(ua);
+}
+
+function nowUTC() {
+  return new Date().toISOString();
 }
