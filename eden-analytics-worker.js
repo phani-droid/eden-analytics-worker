@@ -275,7 +275,7 @@ export default {
         return jsonResponse({
           ok:                true,
           worker:            "eden-analytics",
-          version:           "5.9",
+          version:           "5.10",
           ts:                nowUTC(),
           kv:                !!env.GCLID_KV,
           phi_stripping:     "disabled — BAA active — decisions at BQ dbt",
@@ -428,7 +428,7 @@ async function fireFirstTouch(request, env, anonId, session, url, clickIds, utms
       referrer:         referrer || undefined,
       session_id:       sessionId,
       device_type:      isMobile(ua) ? "mobile" : "desktop",
-      pipeline_version: "5.9",
+      pipeline_version: "5.10",
     },
     context:   { campaign: buildCampaignContext(attribution) },
     timestamp: nowUTC(),
@@ -489,7 +489,7 @@ async function handleCollect(request, env, ctx, url) {
     portal,
     source_type:      "client",
     gpc_opt_out:      gpcOptOut,
-    pipeline_version: "5.9",
+    pipeline_version: "5.10",
   };
 
   if (env.SEGMENT_WRITE_KEY) {
@@ -574,7 +574,7 @@ async function handleServerCollect(request, env, ctx) {
   const superProps = {
     portal:           "patient",
     source_type:      "server",
-    pipeline_version: "5.9",
+    pipeline_version: "5.10",
   };
 
   const attribution = storedAttribution || {};
@@ -1125,7 +1125,7 @@ function corsHeadersObj(origin) {
   return {
     "Access-Control-Allow-Origin":      allowed ? origin : ALLOWED_ORIGINS[0],
     "Access-Control-Allow-Methods":     "POST, GET, OPTIONS",
-    "Access-Control-Allow-Headers":     "Content-Type, X-Eden-Server-Secret",
+    "Access-Control-Allow-Headers":     "Content-Type, X-Eden-Server-Secret, Authorization",
     "Access-Control-Allow-Credentials": "true",
     "Access-Control-Max-Age":           "86400",
   };
