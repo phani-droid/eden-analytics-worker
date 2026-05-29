@@ -1,8 +1,28 @@
 // =============================================================================
-// EdenOS Analytics Worker — v5.6 (FINAL / PRODUCTION)
+// EdenOS Analytics Worker — v5.7 (FINAL / PRODUCTION)
 // =============================================================================
 //
-// FIXES IN v5.6 vs v5.4 (your current deployed version):
+// FIXES IN v5.7 vs v5.6:
+//
+//   FIX 6 — /identify handles server-side calls with no anonymousId
+//     Root cause: /identify only ran linkUserAttribution when BOTH anonId
+//     AND userId were present. Server-side identify calls (from Node.js API
+//     routes) have no browser cookie → anonId = null → KV link never happened
+//     → webhook events could not find gclid via userId.
+//
+//     Fix: /identify now handles two scenarios:
+//       Scenario A (client-side): anonId + userId both present
+//         → copies attr:anon:{anonId} → attr:user:{userId} in KV
+//         → all future webhook events find gclid via userId ✓
+//       Scenario B (server-side): only userId, no anonId
+//         → logs and skips KV copy (nothing to copy)
+//         → Segment identify still fires with userId
+//         → If Scenario A already ran, attr:user:{userId} already has gclid ✓
+//
+//   FIX 7 — eden_anonymous_id cookie name handled everywhere
+//     Worker reads BOTH eden_anon_id (canonical) AND eden_anonymous_id (legacy)
+//     in handleCollect and handlePageRequest for full identity continuity
+//     across the domain migration from tryeden.com → eden.health
 //
 //   FIX 1 — "Event did not have a name" in Segment (CRITICAL)
 //     Root cause: forwardToSegment() sends empty string as event name when
@@ -254,7 +274,7 @@ export default {
         return jsonResponse({
           ok:                true,
           worker:            "eden-analytics",
-          version:           "5.6",
+          version:           "5.7",
           ts:                nowUTC(),
           kv:                !!env.GCLID_KV,
           phi_stripping:     "disabled — BAA active — decisions at BQ dbt",
@@ -407,7 +427,7 @@ async function fireFirstTouch(request, env, anonId, session, url, clickIds, utms
       referrer:         referrer || undefined,
       session_id:       sessionId,
       device_type:      isMobile(ua) ? "mobile" : "desktop",
-      pipeline_version: "5.6",
+      pipeline_version: "5.7",
     },
     context:   { campaign: buildCampaignContext(attribution) },
     timestamp: nowUTC(),
@@ -468,7 +488,7 @@ async function handleCollect(request, env, ctx, url) {
     portal,
     source_type:      "client",
     gpc_opt_out:      gpcOptOut,
-    pipeline_version: "5.6",
+    pipeline_version: "5.7",
   };
 
   if (env.SEGMENT_WRITE_KEY) {
@@ -553,7 +573,7 @@ async function handleServerCollect(request, env, ctx) {
   const superProps = {
     portal:           "patient",
     source_type:      "server",
-    pipeline_version: "5.6",
+    pipeline_version: "5.7",
   };
 
   const attribution = storedAttribution || {};
@@ -605,11 +625,32 @@ async function handleIdentify(request, env, ctx) {
   const userId = body.userId      || null;
 
   // Layer 3 — link userId → full attribution (all click IDs) in KV
-  if (env.GCLID_KV && anonId && userId) {
-    ctx.waitUntil(
-      linkUserAttribution(env.GCLID_KV, anonId, userId)
-        .catch(err => console.error("[eden-analytics] KV identify link error:", err))
-    );
+  //
+  // FIX v5.7: handle two scenarios:
+  //
+  // Scenario A — client-side login (browser has cookie):
+  //   anonId = eden_anon_id cookie value, userId = Bask userId
+  //   Worker copies attr:anon:{anonId} → attr:user:{userId}
+  //   All future server events find gclid via userId
+  //
+  // Scenario B — server-side identify (no browser, no cookie):
+  //   anonId = null, userId = Bask userId only
+  //   Nothing to copy — but Worker still fires Segment identify
+  //   Attribution already in attr:user:{userId} if Scenario A ran first
+  //   If Scenario A never ran: no attribution available (expected — user
+  //   never clicked a paid ad, or identify was called before ad click)
+  //
+  if (env.GCLID_KV && userId) {
+    if (anonId) {
+      // Scenario A — copy attribution from anonymousId → userId
+      ctx.waitUntil(
+        linkUserAttribution(env.GCLID_KV, anonId, userId)
+          .catch(err => console.error("[eden-analytics] KV identify link error:", err))
+      );
+    } else {
+      // Scenario B — no anonId — just log, nothing to copy
+      console.log("[eden-analytics] identify: no anonymousId — server-side call, skipping KV copy");
+    }
   }
 
   if (env.SEGMENT_WRITE_KEY) {
