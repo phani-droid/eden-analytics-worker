@@ -275,7 +275,7 @@ export default {
         return jsonResponse({
           ok:                true,
           worker:            "eden-analytics",
-          version:           "5.8",
+          version:           "5.9",
           ts:                nowUTC(),
           kv:                !!env.GCLID_KV,
           phi_stripping:     "disabled — BAA active — decisions at BQ dbt",
@@ -428,7 +428,7 @@ async function fireFirstTouch(request, env, anonId, session, url, clickIds, utms
       referrer:         referrer || undefined,
       session_id:       sessionId,
       device_type:      isMobile(ua) ? "mobile" : "desktop",
-      pipeline_version: "5.8",
+      pipeline_version: "5.9",
     },
     context:   { campaign: buildCampaignContext(attribution) },
     timestamp: nowUTC(),
@@ -453,7 +453,7 @@ async function fireFirstTouch(request, env, anonId, session, url, clickIds, utms
 async function handleCollect(request, env, ctx, url) {
   const origin = request.headers.get("Origin") || "";
 
-  if (origin && !ALLOWED_ORIGINS.includes(origin)) {
+  if (origin && !isAllowedOrigin(origin)) {
     return new Response("Forbidden", { status: 403 });
   }
 
@@ -489,7 +489,7 @@ async function handleCollect(request, env, ctx, url) {
     portal,
     source_type:      "client",
     gpc_opt_out:      gpcOptOut,
-    pipeline_version: "5.8",
+    pipeline_version: "5.9",
   };
 
   if (env.SEGMENT_WRITE_KEY) {
@@ -574,7 +574,7 @@ async function handleServerCollect(request, env, ctx) {
   const superProps = {
     portal:           "patient",
     source_type:      "server",
-    pipeline_version: "5.8",
+    pipeline_version: "5.9",
   };
 
   const attribution = storedAttribution || {};
@@ -1112,8 +1112,16 @@ function sanitizeUrlString(value) {
 // CORS + RESPONSE HELPERS
 // =============================================================================
 
+function isAllowedOrigin(origin) {
+  if (!origin) return false;
+  if (ALLOWED_ORIGINS.includes(origin)) return true;
+  // Allow all Eden Health Vercel preview deployments — URL hash changes per deploy
+  if (/^https:\/\/[a-z0-9-]+-eden-health\.vercel\.app$/.test(origin)) return true;
+  return false;
+}
+
 function corsHeadersObj(origin) {
-  const allowed = ALLOWED_ORIGINS.includes(origin);
+  const allowed = isAllowedOrigin(origin);
   return {
     "Access-Control-Allow-Origin":      allowed ? origin : ALLOWED_ORIGINS[0],
     "Access-Control-Allow-Methods":     "POST, GET, OPTIONS",
