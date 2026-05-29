@@ -165,6 +165,7 @@ const ALLOWED_ORIGINS = [
   "https://www.eden.health",
   "https://app.eden.health",
   "https://eden-os-rimo-patient-staging.vercel.app",
+  "https://health-os-patient-staging-ojlsev6ct-eden-health.vercel.app",
 ];
 
 
@@ -274,7 +275,7 @@ export default {
         return jsonResponse({
           ok:                true,
           worker:            "eden-analytics",
-          version:           "5.7",
+          version:           "5.8",
           ts:                nowUTC(),
           kv:                !!env.GCLID_KV,
           phi_stripping:     "disabled — BAA active — decisions at BQ dbt",
@@ -427,7 +428,7 @@ async function fireFirstTouch(request, env, anonId, session, url, clickIds, utms
       referrer:         referrer || undefined,
       session_id:       sessionId,
       device_type:      isMobile(ua) ? "mobile" : "desktop",
-      pipeline_version: "5.7",
+      pipeline_version: "5.8",
     },
     context:   { campaign: buildCampaignContext(attribution) },
     timestamp: nowUTC(),
@@ -488,7 +489,7 @@ async function handleCollect(request, env, ctx, url) {
     portal,
     source_type:      "client",
     gpc_opt_out:      gpcOptOut,
-    pipeline_version: "5.7",
+    pipeline_version: "5.8",
   };
 
   if (env.SEGMENT_WRITE_KEY) {
@@ -573,7 +574,7 @@ async function handleServerCollect(request, env, ctx) {
   const superProps = {
     portal:           "patient",
     source_type:      "server",
-    pipeline_version: "5.7",
+    pipeline_version: "5.8",
   };
 
   const attribution = storedAttribution || {};
