@@ -1,28 +1,8 @@
 // =============================================================================
-// EdenOS Analytics Worker — v5.7 (FINAL / PRODUCTION)
+// EdenOS Analytics Worker — v5.6 (FINAL / PRODUCTION)
 // =============================================================================
 //
-// FIXES IN v5.7 vs v5.6:
-//
-//   FIX 6 — /identify handles server-side calls with no anonymousId
-//     Root cause: /identify only ran linkUserAttribution when BOTH anonId
-//     AND userId were present. Server-side identify calls (from Node.js API
-//     routes) have no browser cookie → anonId = null → KV link never happened
-//     → webhook events could not find gclid via userId.
-//
-//     Fix: /identify now handles two scenarios:
-//       Scenario A (client-side): anonId + userId both present
-//         → copies attr:anon:{anonId} → attr:user:{userId} in KV
-//         → all future webhook events find gclid via userId ✓
-//       Scenario B (server-side): only userId, no anonId
-//         → logs and skips KV copy (nothing to copy)
-//         → Segment identify still fires with userId
-//         → If Scenario A already ran, attr:user:{userId} already has gclid ✓
-//
-//   FIX 7 — eden_anonymous_id cookie name handled everywhere
-//     Worker reads BOTH eden_anon_id (canonical) AND eden_anonymous_id (legacy)
-//     in handleCollect and handlePageRequest for full identity continuity
-//     across the domain migration from tryeden.com → eden.health
+// FIXES IN v5.6 vs v5.4 (your current deployed version):
 //
 //   FIX 1 — "Event did not have a name" in Segment (CRITICAL)
 //     Root cause: forwardToSegment() sends empty string as event name when
@@ -165,7 +145,6 @@ const ALLOWED_ORIGINS = [
   "https://www.eden.health",
   "https://app.eden.health",
   "https://eden-os-rimo-patient-staging.vercel.app",
-  "https://health-os-patient-staging-ojlsev6ct-eden-health.vercel.app",
 ];
 
 
@@ -275,7 +254,7 @@ export default {
         return jsonResponse({
           ok:                true,
           worker:            "eden-analytics",
-          version:           "5.10",
+          version:           "5.11",
           ts:                nowUTC(),
           kv:                !!env.GCLID_KV,
           phi_stripping:     "disabled — BAA active — decisions at BQ dbt",
@@ -422,13 +401,62 @@ async function fireFirstTouch(request, env, anonId, session, url, clickIds, utms
     messageId,
     event:       "first_touch",
     properties: {
+      // ── Core ──────────────────────────────────────────────────────────────
       portal,
       page_path:        url.pathname,
       page_url:         cleanUrl,
       referrer:         referrer || undefined,
       session_id:       sessionId,
       device_type:      isMobile(ua) ? "mobile" : "desktop",
-      pipeline_version: "5.10",
+      pipeline_version: "5.11",
+
+      // ── Channel (derived) — group by this in Mixpanel for channel mix ─────
+      // Values: google_paid | meta | tiktok | microsoft | twitter | linkedin
+      //         reddit | pinterest | snapchat | affiliate | organic | email | direct
+      channel: (function(a) {
+        if (a.gclid || a.gbraid || a.wbraid || a.dclid) return "google_paid";
+        if (a.fbclid)                                    return "meta";
+        if (a.ttclid)                                    return "tiktok";
+        if (a.msclkid)                                   return "microsoft";
+        if (a.twclid)                                    return "twitter";
+        if (a.li_fat_id)                                 return "linkedin";
+        if (a.rdt_cid)                                   return "reddit";
+        if (a.epik)                                      return "pinterest";
+        if (a.ScCid)                                     return "snapchat";
+        if (a.irclickid || a.cjevent)                    return "affiliate";
+        if (a.utm_medium === "organic")                  return "organic";
+        if (a.utm_medium === "email" ||
+            a.utm_source === "customer.io")              return "email";
+        if (a.utm_source)                                return a.utm_source;
+        return "direct";
+      })(attribution),
+
+      // ── UTMs — direct properties (bypasses UTM mapping dependency) ────────
+      utm_source:   attribution.utm_source   || null,
+      utm_medium:   attribution.utm_medium   || null,
+      utm_campaign: attribution.utm_campaign || null,
+      utm_content:  attribution.utm_content  || null,
+      utm_term:     attribution.utm_term     || null,
+
+      // ── Click IDs — all 16 channels — direct event properties ─────────────
+      // Adding here means Mixpanel can group/filter by any click ID directly
+      // without depending on context.campaign UTM mapping
+      gclid:     attribution.gclid     || null,  // Google Ads
+      gbraid:    attribution.gbraid    || null,  // Google iOS
+      wbraid:    attribution.wbraid    || null,  // Google Web
+      dclid:     attribution.dclid     || null,  // Google Display
+      fbclid:    attribution.fbclid    || null,  // Meta / Facebook
+      msclkid:   attribution.msclkid   || null,  // Microsoft / Bing
+      ttclid:    attribution.ttclid    || null,  // TikTok
+      twclid:    attribution.twclid    || null,  // Twitter / X
+      li_fat_id: attribution.li_fat_id || null,  // LinkedIn
+      rdt_cid:   attribution.rdt_cid   || null,  // Reddit
+      epik:      attribution.epik      || null,  // Pinterest
+      ScCid:     attribution.ScCid     || null,  // Snapchat
+      nbt:       attribution.nbt       || null,  // Northbeam
+      irclickid: attribution.irclickid || null,  // Impact Radius / Affiliate
+      cjevent:   attribution.cjevent   || null,  // CJ Affiliate
+      click_id:  attribution.click_id  || null,  // Generic
     },
     context:   { campaign: buildCampaignContext(attribution) },
     timestamp: nowUTC(),
@@ -453,7 +481,7 @@ async function fireFirstTouch(request, env, anonId, session, url, clickIds, utms
 async function handleCollect(request, env, ctx, url) {
   const origin = request.headers.get("Origin") || "";
 
-  if (origin && !isAllowedOrigin(origin)) {
+  if (origin && !ALLOWED_ORIGINS.includes(origin)) {
     return new Response("Forbidden", { status: 403 });
   }
 
@@ -489,7 +517,7 @@ async function handleCollect(request, env, ctx, url) {
     portal,
     source_type:      "client",
     gpc_opt_out:      gpcOptOut,
-    pipeline_version: "5.10",
+    pipeline_version: "5.11",
   };
 
   if (env.SEGMENT_WRITE_KEY) {
@@ -574,7 +602,7 @@ async function handleServerCollect(request, env, ctx) {
   const superProps = {
     portal:           "patient",
     source_type:      "server",
-    pipeline_version: "5.10",
+    pipeline_version: "5.11",
   };
 
   const attribution = storedAttribution || {};
@@ -626,32 +654,11 @@ async function handleIdentify(request, env, ctx) {
   const userId = body.userId      || null;
 
   // Layer 3 — link userId → full attribution (all click IDs) in KV
-  //
-  // FIX v5.7: handle two scenarios:
-  //
-  // Scenario A — client-side login (browser has cookie):
-  //   anonId = eden_anon_id cookie value, userId = Bask userId
-  //   Worker copies attr:anon:{anonId} → attr:user:{userId}
-  //   All future server events find gclid via userId
-  //
-  // Scenario B — server-side identify (no browser, no cookie):
-  //   anonId = null, userId = Bask userId only
-  //   Nothing to copy — but Worker still fires Segment identify
-  //   Attribution already in attr:user:{userId} if Scenario A ran first
-  //   If Scenario A never ran: no attribution available (expected — user
-  //   never clicked a paid ad, or identify was called before ad click)
-  //
-  if (env.GCLID_KV && userId) {
-    if (anonId) {
-      // Scenario A — copy attribution from anonymousId → userId
-      ctx.waitUntil(
-        linkUserAttribution(env.GCLID_KV, anonId, userId)
-          .catch(err => console.error("[eden-analytics] KV identify link error:", err))
-      );
-    } else {
-      // Scenario B — no anonId — just log, nothing to copy
-      console.log("[eden-analytics] identify: no anonymousId — server-side call, skipping KV copy");
-    }
+  if (env.GCLID_KV && anonId && userId) {
+    ctx.waitUntil(
+      linkUserAttribution(env.GCLID_KV, anonId, userId)
+        .catch(err => console.error("[eden-analytics] KV identify link error:", err))
+    );
   }
 
   if (env.SEGMENT_WRITE_KEY) {
@@ -1112,20 +1119,12 @@ function sanitizeUrlString(value) {
 // CORS + RESPONSE HELPERS
 // =============================================================================
 
-function isAllowedOrigin(origin) {
-  if (!origin) return false;
-  if (ALLOWED_ORIGINS.includes(origin)) return true;
-  // Allow all Eden Health Vercel preview deployments — URL hash changes per deploy
-  if (/^https:\/\/[a-z0-9-]+-eden-health\.vercel\.app$/.test(origin)) return true;
-  return false;
-}
-
 function corsHeadersObj(origin) {
-  const allowed = isAllowedOrigin(origin);
+  const allowed = ALLOWED_ORIGINS.includes(origin);
   return {
     "Access-Control-Allow-Origin":      allowed ? origin : ALLOWED_ORIGINS[0],
     "Access-Control-Allow-Methods":     "POST, GET, OPTIONS",
-    "Access-Control-Allow-Headers":     "Content-Type, X-Eden-Server-Secret, Authorization",
+    "Access-Control-Allow-Headers":     "Content-Type, X-Eden-Server-Secret",
     "Access-Control-Allow-Credentials": "true",
     "Access-Control-Max-Age":           "86400",
   };
