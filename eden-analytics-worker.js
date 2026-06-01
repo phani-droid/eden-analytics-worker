@@ -1,74 +1,72 @@
 // =============================================================================
-// EdenOS Analytics Worker — v5.8 (PRODUCTION)
+// EdenOS Analytics Worker — v5.20 (PRODUCTION — FINAL)
 // =============================================================================
 //
-// FIXES IN v5.8 vs v5.7:
+// FIXES IN v5.20 vs v5.6 (all fixes cumulative):
 //
-//   FIX 7 — Bridge logic missing from /collect handler (CRITICAL)
-//     Root cause: OS_purchase fires CLIENT-SIDE via analytics.js → /collect
-//     v5.7 bridge was only in handleServerCollect → never triggered for
-//     OS_purchase → attr:user and attr:order were never written to KV →
-//     OS_order_delivered still couldn't resolve gclid → still 0 conversions.
+//   FIX 8 — Checkly synthetic monitor pollution (v5.20)
+//     Checkly injects fake click IDs (checkly-vwo-gclid) → UNPARSEABLE_GCLID
+//     errors in Google Ads + pollutes KV with fake attribution.
+//     Fix: isSyntheticMonitor() blocks Checkly at worker entry point.
+//     Detects via: eden_checkly_marker param, utm_medium=synthetic,
+//     utm_source contains "checkly", or User-Agent contains "checklyhq".
 //
-//     Fix: Bridge logic added to handleCollect identically to handleServerCollect.
-//     At OS_purchase in /collect:
-//       → writes attr:user:{userId}   (fixes all future server events)
-//       → writes attr:order:{orderId} (direct fallback for OS_order_delivered)
-//     handleServerCollect bridge retained for any server-fired OS_purchase.
-//     All conditions identical: requires storedAttribution with click ID present.
+//   FIX 7 — Bridge logic missing from /collect (v5.8)
+//     OS_purchase fires CLIENT-SIDE via analytics.js → /collect, not
+//     /server-collect. Bridge was only in handleServerCollect → never
+//     triggered → attr:user + attr:order never written → OS_order_delivered
+//     still had no gclid → still 0 conversions.
+//     Fix: Bridge added to handleCollect identically.
 //
-// FIXES IN v5.7 vs v5.6:
+//   FIX 6 — OS_order_delivered zero conversions in Google Ads (v5.7)
+//     /identify never called → attr:user:{userId} never written → server-side
+//     events couldn't resolve gclid → Segment filter dropped 99.98% of events.
+//     Fix A: resolveAttribution() accepts orderId as 3rd parallel KV lookup.
+//     Fix B: OS_purchase writes attr:user:{userId} + attr:order:{orderId}.
+//     Fix C: OS_order_delivered writes attr:user:{userId} opportunistically.
 //
-//   FIX 6 — OS_order_delivered zero conversions in Google Ads (CRITICAL)
-//     Root cause: /identify was never called → attr:user:{userId} never written
-//     to KV → OS_order_delivered (server-side, no cookie) couldn't resolve gclid
-//     → Segment filter (gclid+gbraid+wbraid all null) dropped 99.98% of events
-//     → Google Ads showed 0 conversions for EdenOS - OrderComplete.
-//
-//     Fix A — resolveAttribution() now accepts orderId as 3rd fallback lookup
-//       New KV key: attr:order:{orderId} → attribution
-//       Priority: attr:anon → attr:user → attr:order
-//       Parallel reads (Promise.all) — no latency impact
-//
-//     Fix B — At OS_purchase (server-side path):
-//       Worker writes TWO additional KV keys:
-//         attr:user:{userId}   → attribution (fixes all future server events)
-//         attr:order:{orderId} → attribution (order-level fallback)
-//       storeAttribution() first-touch rule still applies — no overwrites.
-//
-//     Fix C — At OS_order_delivered (server-side, has userId):
-//       If attribution resolved, also writes attr:user:{userId} for future events.
+//   FIX 5 — version strings updated throughout (v5.20)
 //
 // ALL PREVIOUS FIXES RETAINED:
 //   v5.6 FIX 1 — "Event did not have a name" — page/identify/screen routing
 //   v5.6 FIX 2 — First-touch rule covers ALL click IDs (not just gclid)
 //   v5.6 FIX 3 — linkUserAttribution() covers ALL click IDs
-//   v5.6 FIX 4 — page_viewed inflation fix (worker does not fire page_viewed)
+//   v5.6 FIX 4 — page_viewed inflation fix
 //   v5.4 FIX 1 — /collect/* startsWith() for analytics.js subpaths
 //   v5.4 FIX 2 — nowUTC() uses Date.now()
 //   v5.4 FIX 3 — CORS headers on /server-collect responses
 //
 // =============================================================================
 //
-// ARCHITECTURE — five coverage layers (UNCHANGED):
-//
-//   Layer 1 — HttpOnly cookie (eden_anon_id)
-//   Layer 2 — Cloudflare KV attribution (120 days)
+// ARCHITECTURE — five coverage layers:
+//   Layer 1 — HttpOnly cookie (eden_anon_id) — 2 years, ITP-resistant
+//   Layer 2 — Cloudflare KV attribution (120 days, first-touch, all 16 channels)
 //   Layer 3 — userId → attribution link at /identify
 //   Layer 4 — email_sha256 enhanced conversions
 //   Layer 5 — Organic referrer detection
 //
-// KV KEY SCHEMA (v5.7 additions marked NEW):
-//   attr:anon:{anonymousId}     → attribution object (120 days)
-//   attr:user:{userId}          → attribution object (120 days)
-//   attr:order:{orderId}        → attribution object (120 days) [NEW v5.7]
-//   dedup:{eventName}:{orderId} → dedup lock         (24 hours)
+// KV KEY SCHEMA:
+//   attr:anon:{anonymousId}     → attribution (120 days)
+//   attr:user:{userId}          → attribution (120 days)
+//   attr:order:{orderId}        → attribution (120 days) [v5.7]
+//   dedup:{eventName}:{orderId} → dedup lock  (24 hours)
 //
+// ROUTES (wrangler.toml):
+//   eden.health/*  |  www.eden.health/*  |  app.eden.health/*
+//
+// ENDPOINTS:
+//   /*               → page requests → cookie + KV store
+//   /collect         → client-side events (exact)
+//   /collect/*       → client-side events (analytics.js subpaths)
+//   /server-collect  → server-side events → dedup → KV → Segment
+//   /identify        → login/signup → KV userId link → Segment identify
+//   /eden-health-check → health status
 // =============================================================================
 
 
 // ─────────────────────────────────────────────────────────────────────────────
 // PCI STRIPPING — DISABLED (BAA active, PHI/PCI decisions at BQ dbt)
+// Uncomment + deploy when Jared confirms which fields need stripping
 // ─────────────────────────────────────────────────────────────────────────────
 // const PCI_PROPS = new Set([
 //   "card_number", "card_exp_date", "card_cvc",
@@ -78,7 +76,7 @@
 
 
 // ─────────────────────────────────────────────────────────────────────────────
-// ALLOWED ORIGINS — UNCHANGED
+// ALLOWED ORIGINS
 // ─────────────────────────────────────────────────────────────────────────────
 
 const ALLOWED_ORIGINS = [
@@ -89,7 +87,7 @@ const ALLOWED_ORIGINS = [
 
 
 // ─────────────────────────────────────────────────────────────────────────────
-// CLICK ID CONFIG — all 16 paid channels — UNCHANGED
+// CLICK ID CONFIG — all 16 paid channels
 // ─────────────────────────────────────────────────────────────────────────────
 
 const CLICK_ID_CONFIG = [
@@ -115,7 +113,7 @@ const CLICK_ID_PARAMS = CLICK_ID_CONFIG.map(c => c.param);
 
 
 // ─────────────────────────────────────────────────────────────────────────────
-// CONVERSION EVENTS — UNCHANGED
+// CONVERSION EVENTS
 // ─────────────────────────────────────────────────────────────────────────────
 
 const CONVERSION_EVENTS = new Set([
@@ -137,9 +135,6 @@ const EVENT_NAME_ALIASES = {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // BOT DETECTION
-// v5.8: added Checkly synthetic monitor detection
-//   Checkly injects fake click IDs (checkly-vwo-gclid etc.) which cause
-//   UNPARSEABLE_GCLID errors in Google Ads. Block at worker level.
 // ─────────────────────────────────────────────────────────────────────────────
 
 const BOT_UA_PATTERNS = [
@@ -147,7 +142,7 @@ const BOT_UA_PATTERNS = [
   /lighthouse/i, /pagespeed/i, /playwright/i,
   /puppeteer/i, /preview/i, /prerender/i,
   /google-inspectiontool/i,
-  /checklyhq/i,   // NEW v5.8 — Checkly synthetic monitors
+  /checklyhq/i,  // v5.20 — Checkly synthetic monitor UA
 ];
 
 const BOT_CF_DECISIONS = new Set([
@@ -156,7 +151,7 @@ const BOT_CF_DECISIONS = new Set([
 
 
 // ─────────────────────────────────────────────────────────────────────────────
-// STATIC ASSET DETECTION — UNCHANGED
+// STATIC ASSET DETECTION
 // ─────────────────────────────────────────────────────────────────────────────
 
 const STATIC_EXTENSIONS = [
@@ -180,21 +175,17 @@ const SENSITIVE_URL_PARAMS = [
 
 // ─────────────────────────────────────────────────────────────────────────────
 // KV KEY SCHEMA + TTLs
-//   attr:anon:{anonymousId}     → attribution object (120 days)
-//   attr:user:{userId}          → attribution object (120 days)
-//   attr:order:{orderId}        → attribution object (120 days) [NEW v5.7]
-//   dedup:{eventName}:{orderId} → dedup lock         (24 hours)
 // ─────────────────────────────────────────────────────────────────────────────
 
 const KV_ANON_PREFIX  = "attr:anon:";
 const KV_USER_PREFIX  = "attr:user:";
-const KV_ORDER_PREFIX = "attr:order:"; // NEW v5.7
-const KV_TTL          = 10368000;      // 120 days in seconds
-const KV_DEDUP_TTL    = 86400;         // 24 hours in seconds
+const KV_ORDER_PREFIX = "attr:order:";  // v5.7
+const KV_TTL          = 10368000;       // 120 days
+const KV_DEDUP_TTL    = 86400;          // 24 hours
 
 
 // =============================================================================
-// WORKER ENTRY POINT — UNCHANGED
+// WORKER ENTRY POINT
 // =============================================================================
 
 export default {
@@ -205,27 +196,27 @@ export default {
       // ── Health check ──────────────────────────────────────────────────────
       if (url.pathname === "/eden-health-check") {
         return jsonResponse({
-          ok:                true,
-          worker:            "eden-analytics",
-          version:           "5.20",
-          hardening_version: "5.20-checkly-block-prod-only",
-          synthetic_monitor_block: "enabled — Checkly fake gclid pollution prevented",
-          ts:                nowUTC(),
-          kv:                !!env.GCLID_KV,
+          ok:                          true,
+          worker:                      "eden-analytics",
+          version:                     "5.20",
+          hardening_version:           "5.20-final-prod-only",
+          ts:                          nowUTC(),
+          kv:                          !!env.GCLID_KV,
           segment_write_key_configured: !!env.SEGMENT_WRITE_KEY,
-          server_secret_configured:     !!env.SERVER_API_SECRET,
-          phi_stripping:     "disabled — BAA active — decisions at BQ dbt",
-          gpc_handling:      "enabled — California/Virginia legal compliance",
-          attribution_model: "first-touch — all 16 click IDs protected",
-          attribution_ttl:   "120 days",
-          dedup_ttl:         "24 hours",
-          dedup_key:         "Bask order_id (static UUID — NOT Stripe transaction_id)",
-          collect_subpaths:  "enabled — /collect /collect/p /collect/t /collect/m",
-          event_naming:      "fixed — no more empty event names",
-          page_inflation:    "fixed — worker does not fire page_viewed",
-          order_bridge:      "enabled v5.8 — OS_purchase bridge in /collect + /server-collect",
-          routes:            ["eden.health/*", "www.eden.health/*", "app.eden.health/*"],
-          channels:          CLICK_ID_CONFIG.map(c => c.label),
+          server_secret_configured:    !!env.SERVER_API_SECRET,
+          phi_stripping:               "disabled — BAA active — decisions at BQ dbt",
+          gpc_handling:                "enabled — California/Virginia legal compliance",
+          attribution_model:           "first-touch — all 16 click IDs protected",
+          attribution_ttl:             "120 days",
+          dedup_ttl:                   "24 hours",
+          dedup_key:                   "Bask order_id (static UUID — NOT Stripe transaction_id)",
+          collect_subpaths:            "enabled — /collect /collect/p /collect/t /collect/m",
+          event_naming:                "fixed — no more empty event names",
+          page_inflation:              "fixed — worker does not fire page_viewed",
+          order_bridge:                "enabled v5.8 — OS_purchase writes attr:order + attr:user in /collect + /server-collect",
+          synthetic_monitor_block:     "enabled v5.20 — Checkly fake gclid pollution prevented",
+          routes:                      ["eden.health/*", "www.eden.health/*", "app.eden.health/*"],
+          channels:                    CLICK_ID_CONFIG.map(c => c.label),
         });
       }
 
@@ -240,7 +231,8 @@ export default {
       // ── Skip bots ─────────────────────────────────────────────────────────
       if (isBot(request)) return fetch(request);
 
-      // ── Skip synthetic monitors (Checkly) — prevent fake gclid pollution ──
+      // ── Skip synthetic monitors (Checkly etc.) ────────────────────────────
+      // Prevents fake click IDs from polluting KV + causing Google Ads errors
       if (isSyntheticMonitor(request, url)) {
         console.log("[eden-analytics] synthetic monitor blocked:", url.searchParams.get("utm_source") || "unknown");
         return fetch(request);
@@ -276,7 +268,10 @@ export default {
 
 
 // =============================================================================
-// PAGE REQUEST HANDLER — UNCHANGED
+// PAGE REQUEST HANDLER
+// Sets cookie (Layer 1), stores attribution in KV (Layer 2)
+// Fires first_touch once per session when paid attribution present
+// Does NOT fire page_viewed — analytics.js handles via /collect
 // =============================================================================
 
 async function handlePageRequest(request, env, ctx, url) {
@@ -327,15 +322,16 @@ async function handlePageRequest(request, env, ctx, url) {
 
 
 // =============================================================================
-// FIRST TOUCH EVENT — UNCHANGED
+// FIRST TOUCH EVENT
+// Fires once per session when paid attribution present
 // =============================================================================
 
 async function fireFirstTouch(request, env, anonId, session, url, clickIds, utms) {
-  const cleanUrl  = sanitizeUrl(url);
-  const referrer  = sanitizeUrlString(request.headers.get("Referer") || "");
-  const ua        = request.headers.get("User-Agent") || "";
-  const portal    = url.hostname.includes("app.eden.health") ? "patient" : "marketing";
-  const sessionId = session.split("_")[0];
+  const cleanUrl   = sanitizeUrl(url);
+  const referrer   = sanitizeUrlString(request.headers.get("Referer") || "");
+  const ua         = request.headers.get("User-Agent") || "";
+  const portal     = url.hostname.includes("app.eden.health") ? "patient" : "marketing";
+  const sessionId  = session.split("_")[0];
 
   const organic     = !utms && !clickIds.gclid && referrer ? detectOrganic(referrer) : null;
   const attribution = { ...(utms || organic || {}), ...clickIds };
@@ -351,16 +347,16 @@ async function fireFirstTouch(request, env, anonId, session, url, clickIds, utms
     event:       "first_touch",
     properties: {
       portal,
-      page_path:        url.pathname,
-      page_url:         cleanUrl,
-      referrer:         referrer || undefined,
-      session_id:       sessionId,
-      device_type:      isMobile(ua) ? "mobile" : "desktop",
-      pipeline_version: "5.17",
+      page_path:            url.pathname,
+      page_url:             cleanUrl,
+      referrer:             referrer || undefined,
+      session_id:           sessionId,
+      device_type:          isMobile(ua) ? "mobile" : "desktop",
+      pipeline_version:     "5.20",
       ...campaignProps,
-      acquisition_channel: deriveAcquisitionChannel(campaignProps),
-      attribution_source:  campaignProps.utm_source || deriveClickIdSource(campaignProps),
-      attribution_medium:  campaignProps.utm_medium || undefined,
+      acquisition_channel:  deriveAcquisitionChannel(campaignProps),
+      attribution_source:   campaignProps.utm_source || deriveClickIdSource(campaignProps),
+      attribution_medium:   campaignProps.utm_medium || undefined,
       attribution_campaign: campaignProps.utm_campaign || undefined,
     },
     context:   { campaign: campaignProps },
@@ -370,7 +366,12 @@ async function fireFirstTouch(request, env, anonId, session, url, clickIds, utms
 
 
 // =============================================================================
-// /collect HANDLER — UNCHANGED
+// /collect HANDLER — CLIENT-SIDE EVENTS
+//
+// v5.8: Added OS_purchase bridge — writes attr:user + attr:order to KV
+//   OS_purchase is client-side (analytics.js → /collect), so it has
+//   the eden_anon_id cookie → can resolve gclid from attr:anon → bridges
+//   to attr:user + attr:order so server-side events resolve gclid later.
 // =============================================================================
 
 async function handleCollect(request, env, ctx, url) {
@@ -418,35 +419,19 @@ async function handleCollect(request, env, ctx, url) {
     portal,
     source_type:      "client",
     gpc_opt_out:      gpcOptOut,
-    pipeline_version: "5.17",
+    pipeline_version: "5.20",
   };
 
-  // ─────────────────────────────────────────────────────────────────────────
-  // v5.7 BRIDGE — also runs in handleCollect because OS_purchase is CLIENT-SIDE
-  // analytics.js fires OS_purchase → /collect (not /server-collect)
-  // So the bridge must live here too, not only in handleServerCollect.
-  // Identical logic: writes attr:user + attr:order at OS_purchase time.
-  // ─────────────────────────────────────────────────────────────────────────
+  // ── v5.8 OS_purchase bridge ───────────────────────────────────────────────
+  // OS_purchase fires client-side with cookie → resolves attr:anon → has gclid
+  // Write attr:user + attr:order so server-side OS_order_delivered resolves it
   const collectEventName = canonicalizeEventName(resolveEventName(body));
   const collectOrderId   = resolveOrderId(body);
   const collectUserId    = resolveUserIdFromBody(body);
 
-  // DEBUG v5.8 — remove after confirming attr:user + attr:order appear in KV
-  if (collectEventName === "OS_purchase") {
-    console.log("[eden-analytics][debug] OS_purchase in /collect", {
-      collectEventName,
-      collectUserId,
-      collectOrderId,
-      anonId,
-      hasAttribution:    !!attribution,
-      attributionKeys:   attribution ? Object.keys(attribution) : [],
-      hasClickId:        attribution ? CLICK_ID_PARAMS.some(p => attribution[p]) : false,
-      clickIdsFound:     attribution ? CLICK_ID_PARAMS.filter(p => attribution[p]) : [],
-    });
-  }
-
   if (
     env.GCLID_KV &&
+    !gpcOptOut &&
     collectEventName === "OS_purchase" &&
     attribution &&
     CLICK_ID_PARAMS.some(p => attribution[p])
@@ -489,16 +474,11 @@ async function handleCollect(request, env, ctx, url) {
 
 
 // =============================================================================
-// /server-collect HANDLER
+// /server-collect HANDLER — SERVER-SIDE EVENTS
 //
-// v5.7 CHANGES (additive only — all existing logic preserved):
-//   1. resolveAttribution() now called with orderId as 3rd argument
-//   2. After attribution resolved, if eventName === "OS_purchase":
-//      → writes attr:user:{userId} (fixes future server events for this user)
-//      → writes attr:order:{orderId} (order-level fallback for OS_order_delivered)
-//   3. If eventName === "OS_order_delivered" and attribution resolved:
-//      → writes attr:user:{userId} as opportunistic forward-fix
-//   All writes use existing storeAttribution() — first-touch rule still applies.
+// v5.7: resolveAttribution now uses orderId as 3rd fallback lookup
+// v5.7: OS_purchase bridge writes attr:user + attr:order (server-fired path)
+// v5.7: OS_order_delivered opportunistically writes attr:user
 // =============================================================================
 
 async function handleServerCollect(request, env, ctx) {
@@ -525,11 +505,11 @@ async function handleServerCollect(request, env, ctx) {
   const orderId      = resolveOrderId(body);
 
   if (eventName) body.event = eventName;
-  if (userId) body.userId = userId;
-  if (anonId) body.anonymousId = anonId;
+  if (userId)    body.userId = userId;
+  if (anonId)    body.anonymousId = anonId;
   if (orderId && !body.properties.order_id) body.properties.order_id = orderId;
 
-  // Edge dedup — UNCHANGED
+  // ── Edge dedup — 24hr TTL per order_id ───────────────────────────────────
   if (CONVERSION_EVENTS.has(eventName) && orderId && env.GCLID_KV) {
     const dedupKey = `dedup:${eventName}:${orderId}`;
     try {
@@ -549,40 +529,26 @@ async function handleServerCollect(request, env, ctx) {
     }
   }
 
-  // ─────────────────────────────────────────────────────────────────────────
-  // v5.7 CHANGE 1: pass orderId to resolveAttribution as 3rd fallback
-  // Falls back to attr:order:{orderId} if anon + user lookups return nothing
-  // ─────────────────────────────────────────────────────────────────────────
+  // ── v5.7: resolve attribution with orderId as 3rd fallback ───────────────
   const storedAttribution = env.GCLID_KV
     ? await resolveAttribution(env.GCLID_KV, anonId, userId, orderId)
     : null;
 
-  // Merge stored attribution — explicit engineer values always win — UNCHANGED
+  // Merge stored attribution — explicit engineer values always win
   if (storedAttribution && body.properties) {
     for (const [k, v] of Object.entries(storedAttribution)) {
       if (!body.properties[k] && v) body.properties[k] = v;
     }
   }
 
-  // ─────────────────────────────────────────────────────────────────────────
-  // v5.7 CHANGE 2: attribution bridge — additive KV writes at key events
-  //
-  // OS_purchase (client-side, has anonId + gclid):
-  //   → write attr:user:{userId}   so future server events resolve gclid
-  //   → write attr:order:{orderId} so OS_order_delivered resolves gclid
-  //
-  // OS_order_delivered (server-side, has userId):
-  //   → write attr:user:{userId} opportunistically for future events
-  //
-  // Uses existing storeAttribution() — first-touch rule fully preserved.
-  // Wrapped in ctx.waitUntil — never blocks the main response path.
-  // ─────────────────────────────────────────────────────────────────────────
+  // ── v5.7: attribution bridge ──────────────────────────────────────────────
+  // OS_purchase (server path): write attr:user + attr:order
+  // OS_order_delivered: opportunistically write attr:user
   if (env.GCLID_KV && storedAttribution && CLICK_ID_PARAMS.some(p => storedAttribution[p])) {
 
     if (eventName === "OS_purchase") {
       ctx.waitUntil(
         Promise.all([
-          // Link userId → attribution (fixes all future server events for this user)
           userId ? storeAttribution(
             env.GCLID_KV,
             KV_USER_PREFIX + userId,
@@ -590,7 +556,6 @@ async function handleServerCollect(request, env, ctx) {
           ).catch(err => console.error("[eden-analytics] purchase user-link error:", err))
           : Promise.resolve(),
 
-          // Link orderId → attribution (direct fallback for OS_order_delivered)
           orderId ? storeAttribution(
             env.GCLID_KV,
             KV_ORDER_PREFIX + orderId,
@@ -602,8 +567,6 @@ async function handleServerCollect(request, env, ctx) {
     }
 
     if (eventName === "OS_order_delivered" && userId) {
-      // Opportunistically write attr:user so future server events for this
-      // user resolve attribution without needing the order bridge again.
       ctx.waitUntil(
         storeAttribution(
           env.GCLID_KV,
@@ -614,13 +577,12 @@ async function handleServerCollect(request, env, ctx) {
     }
   }
 
-  // Always UTC timestamp — UNCHANGED
   body.timestamp = nowUTC();
 
   const superProps = {
     portal:           "patient",
     source_type:      "server",
-    pipeline_version: "5.17",
+    pipeline_version: "5.20",
     ...(identity.identityWarning ? { identity_warning: identity.identityWarning } : {}),
   };
 
@@ -646,16 +608,14 @@ async function handleServerCollect(request, env, ctx) {
   const origin = request.headers.get("Origin") || "";
   return new Response(JSON.stringify({ ok: true }), {
     status:  200,
-    headers: {
-      "Content-Type": "application/json",
-      ...corsHeadersObj(origin),
-    },
+    headers: { "Content-Type": "application/json", ...corsHeadersObj(origin) },
   });
 }
 
 
 // =============================================================================
-// /identify HANDLER — UNCHANGED
+// /identify HANDLER — LOGIN / ACCOUNT CREATION
+// Links anonymousId → userId attribution in KV (copy-only, first-touch preserved)
 // =============================================================================
 
 async function handleIdentify(request, env, ctx) {
@@ -701,7 +661,9 @@ async function handleIdentify(request, env, ctx) {
 
 
 // =============================================================================
-// SEGMENT FORWARDING — UNCHANGED (v5.6 fixes retained)
+// SEGMENT FORWARDING
+// Routes page/identify/screen/track to correct Segment endpoints
+// Ensures no empty event names reach Segment
 // =============================================================================
 
 async function forwardToSegment(writeKey, body, anonId, superProps, attribution = {}) {
@@ -715,6 +677,7 @@ async function forwardToSegment(writeKey, body, anonId, superProps, attribution 
     },
   };
 
+  // ── identify ──────────────────────────────────────────────────────────────
   if (type === "identify") {
     const traits = await hashEmail(body.traits || body.properties || {});
     await segmentPost(writeKey, "identify", {
@@ -727,11 +690,12 @@ async function forwardToSegment(writeKey, body, anonId, superProps, attribution 
     return;
   }
 
+  // ── page ──────────────────────────────────────────────────────────────────
   if (type === "page") {
     await segmentPost(writeKey, "page", {
       anonymousId: anonId,
       userId:      resolveUserIdFromBody(body),
-      name:        body.name   || body.properties?.name || "",
+      name:        body.name || body.properties?.name || "",
       properties:  await hashEmail({ ...superProps, ...(body.properties || {}) }),
       context:     mergedContext,
       timestamp:   nowUTC(),
@@ -739,6 +703,7 @@ async function forwardToSegment(writeKey, body, anonId, superProps, attribution 
     return;
   }
 
+  // ── screen ────────────────────────────────────────────────────────────────
   if (type === "screen") {
     const screenName = body.name || body.properties?.name || "Unknown Screen";
     await segmentPost(writeKey, "track", {
@@ -752,7 +717,7 @@ async function forwardToSegment(writeKey, body, anonId, superProps, attribution 
     return;
   }
 
-  // track (default)
+  // ── track (default) ───────────────────────────────────────────────────────
   const eventName = canonicalizeEventName(resolveEventName(body)) || null;
   const orderId   = resolveOrderId(body);
   if (eventName) body.event = eventName;
@@ -781,11 +746,9 @@ async function forwardToSegment(writeKey, body, anonId, superProps, attribution 
 
 // =============================================================================
 // KV ATTRIBUTION — STORAGE + RETRIEVAL
-//
-// v5.7 CHANGE: resolveAttribution() accepts orderId as optional 3rd argument.
-// Adds attr:order:{orderId} as 3rd parallel KV lookup.
-// Priority unchanged: anon → user → order (new).
-// All other logic (first-touch, copy-only, fail-open) fully preserved.
+// first-touch rule: any stored click ID blocks retargeting overwrite
+// copy-only rule: userId copy skipped if userId already has attribution
+// fail-open: KV errors never block a real conversion
 // =============================================================================
 
 async function storeAttribution(kv, key, attribution) {
@@ -825,23 +788,21 @@ async function getAttribution(kv, key) {
   }
 }
 
-// v5.7: added orderId parameter — 3rd parallel lookup via attr:order:{orderId}
+// v5.7: orderId as optional 3rd parallel lookup
+// Priority: anon (current session) → user (cross-device) → order (v5.7 bridge)
 async function resolveAttribution(kv, anonId, userId, orderId = null) {
   if (!kv) return null;
 
-  // All three lookups run in parallel — no added latency vs v5.6
   const [fromAnon, fromUser, fromOrder] = await Promise.all([
     anonId  ? getAttribution(kv, KV_ANON_PREFIX  + anonId)  : Promise.resolve(null),
     userId  ? getAttribution(kv, KV_USER_PREFIX   + userId)  : Promise.resolve(null),
     orderId ? getAttribution(kv, KV_ORDER_PREFIX  + orderId) : Promise.resolve(null),
   ]);
 
-  // Priority: anon (current session) → user (cross-device) → order (new v5.7 bridge)
   if (fromAnon  && CLICK_ID_PARAMS.some(p => fromAnon[p]))  return fromAnon;
   if (fromUser  && CLICK_ID_PARAMS.some(p => fromUser[p]))  return fromUser;
   if (fromOrder && CLICK_ID_PARAMS.some(p => fromOrder[p])) return fromOrder;
 
-  // Return whatever we have — UTMs valuable even without click IDs
   return fromAnon || fromUser || fromOrder || null;
 }
 
@@ -864,7 +825,8 @@ async function linkUserAttribution(kv, anonId, userId) {
 
 
 // =============================================================================
-// EMAIL HASHING — UNCHANGED
+// EMAIL HASHING — SHA-256, lowercase + trim per Google/Meta enhanced conversions
+// Raw email also kept — BAA signed, PHI legal via Segment
 // =============================================================================
 
 async function hashEmail(props) {
@@ -897,7 +859,7 @@ async function sha256(value) {
 
 
 // =============================================================================
-// TIMESTAMP — UNCHANGED
+// TIMESTAMP — always UTC, never future
 // =============================================================================
 
 function nowUTC() {
@@ -906,7 +868,7 @@ function nowUTC() {
 
 
 // =============================================================================
-// UTM + CLICK ID EXTRACTION — UNCHANGED
+// UTM + CLICK ID EXTRACTION
 // =============================================================================
 
 function extractUTMs(url) {
@@ -929,7 +891,8 @@ function extractClickIds(url) {
 
 
 // =============================================================================
-// ORGANIC SEARCH DETECTION — UNCHANGED
+// ORGANIC SEARCH DETECTION — Layer 5 fallback
+// Never fabricates attribution — only labels confirmed organic referrers
 // =============================================================================
 
 function detectOrganic(referrer) {
@@ -962,7 +925,49 @@ function detectOrganic(referrer) {
 
 
 // =============================================================================
-// ATTRIBUTION HELPERS — UNCHANGED
+// BOT DETECTION
+// =============================================================================
+
+function isBot(request) {
+  const ua = request.headers.get("User-Agent") || "";
+  if (BOT_UA_PATTERNS.some(p => p.test(ua))) return true;
+  const decision = request.cf?.botManagement?.decision;
+  if (decision && BOT_CF_DECISIONS.has(decision)) return true;
+  if (request.cf?.botManagement?.verifiedBot) return true;
+  return false;
+}
+
+
+// =============================================================================
+// SYNTHETIC MONITOR DETECTION — v5.20
+// Blocks Checkly and other synthetic monitors from polluting KV with fake
+// click IDs that cause UNPARSEABLE_GCLID errors in Google Ads
+// =============================================================================
+
+function isSyntheticMonitor(request, url) {
+  if (url.searchParams.has("eden_checkly_marker"))                    return true;
+  if (url.searchParams.get("utm_medium") === "synthetic")             return true;
+  if ((url.searchParams.get("utm_source") || "").includes("checkly")) return true;
+  const ua = request.headers.get("User-Agent") || "";
+  if (/checklyhq/i.test(ua))                                          return true;
+  return false;
+}
+
+
+// =============================================================================
+// STATIC ASSET DETECTION
+// =============================================================================
+
+function isStaticAsset(url) {
+  const p = url.pathname.toLowerCase();
+  if (STATIC_PREFIXES.some(prefix => p.startsWith(prefix))) return true;
+  if (STATIC_EXTENSIONS.some(ext => p.endsWith(ext))) return true;
+  return false;
+}
+
+
+// =============================================================================
+// ATTRIBUTION HELPERS
 // =============================================================================
 
 function canonicalizeEventName(eventName) {
@@ -987,20 +992,20 @@ function resolveEventName(body) {
 function resolveOrderId(body) {
   return (
     body.properties?.order_id ||
-    body.properties?.orderId ||
-    body.order_id ||
-    body.orderId ||
+    body.properties?.orderId  ||
+    body.order_id             ||
+    body.orderId              ||
     null
   );
 }
 
 function resolveUserIdFromBody(body) {
   return (
-    body.userId ||
-    body.user_id ||
-    body.properties?.userId ||
-    body.properties?.user_id ||
-    body.properties?.patient_id ||
+    body.userId               ||
+    body.user_id              ||
+    body.properties?.userId   ||
+    body.properties?.user_id  ||
+    body.properties?.patient_id  ||
     body.properties?.customer_id ||
     null
   );
@@ -1014,11 +1019,11 @@ function resolveIdentityFromBody(request, body) {
   const userId = resolveUserIdFromBody(body);
 
   let anonymousId =
-    cookieAnonId ||
-    body.anonymousId ||
-    body.anonymous_id ||
-    body.anonymoous_id ||
-    body.properties?.anonymousId ||
+    cookieAnonId               ||
+    body.anonymousId           ||
+    body.anonymous_id          ||
+    body.anonymoous_id         ||
+    body.properties?.anonymousId  ||
     body.properties?.anonymous_id ||
     body.properties?.anonymoous_id ||
     null;
@@ -1066,13 +1071,14 @@ function deriveAcquisitionChannel(campaign) {
   if (
     medium === "cpc" || medium === "paid" || medium === "paid_search" ||
     campaign.gclid || campaign.gbraid || campaign.wbraid || campaign.dclid ||
-    campaign.msclkid || source.includes("google") || source.includes("bing") || source.includes("microsoft")
+    campaign.msclkid ||
+    source.includes("google") || source.includes("bing") || source.includes("microsoft")
   ) return "paid_search";
 
   if (
     campaign.fbclid || campaign.ttclid ||
     source.includes("facebook") || source.includes("instagram") ||
-    source.includes("meta") || source.includes("tiktok")
+    source.includes("meta")     || source.includes("tiktok")
   ) return "paid_social";
 
   return source || "unknown";
@@ -1111,7 +1117,7 @@ function buildCampaignContext(attribution) {
 
 
 // =============================================================================
-// SEGMENT POST — UNCHANGED
+// SEGMENT POST
 // =============================================================================
 
 async function segmentPost(writeKey, endpoint, payload) {
@@ -1130,49 +1136,9 @@ async function segmentPost(writeKey, endpoint, payload) {
 }
 
 
-// ─────────────────────────────────────────────────────────────────────────────
-// SYNTHETIC MONITOR DETECTION
-// Detects Checkly and other synthetic monitors by URL marker or UA
-// Prevents fake click IDs from polluting KV and Google Ads
-// ─────────────────────────────────────────────────────────────────────────────
-
-function isSyntheticMonitor(request, url) {
-  // Checkly injects eden_checkly_marker into URLs
-  if (url.searchParams.has("eden_checkly_marker")) return true;
-  // Checkly utm_medium=synthetic
-  if (url.searchParams.get("utm_medium") === "synthetic") return true;
-  // Checkly source
-  if ((url.searchParams.get("utm_source") || "").includes("checkly")) return true;
-  // UA check (backup)
-  const ua = request.headers.get("User-Agent") || "";
-  if (/checklyhq/i.test(ua)) return true;
-  return false;
-}
-
-
-  const ua = request.headers.get("User-Agent") || "";
-  if (BOT_UA_PATTERNS.some(p => p.test(ua))) return true;
-  const decision = request.cf?.botManagement?.decision;
-  if (decision && BOT_CF_DECISIONS.has(decision)) return true;
-  if (request.cf?.botManagement?.verifiedBot) return true;
-  return false;
-}
-
-
 // =============================================================================
-// STATIC ASSET DETECTION — UNCHANGED
-// =============================================================================
-
-function isStaticAsset(url) {
-  const p = url.pathname.toLowerCase();
-  if (STATIC_PREFIXES.some(prefix => p.startsWith(prefix))) return true;
-  if (STATIC_EXTENSIONS.some(ext => p.endsWith(ext))) return true;
-  return false;
-}
-
-
-// =============================================================================
-// COOKIE HELPERS — UNCHANGED
+// COOKIE HELPERS — Layer 1 ITP-resistant HttpOnly first-party cookies
+// Domain=.eden.health spans eden.health AND app.eden.health
 // =============================================================================
 
 function readCookie(request, name) {
@@ -1191,7 +1157,7 @@ function cookieDomain(url) {
 function buildAnonCookie(id, url) {
   return [
     `eden_anon_id=${encodeURIComponent(id)}`,
-    "Max-Age=63072000",
+    "Max-Age=63072000",            // 2 years
     `Domain=${cookieDomain(url)}`,
     "Path=/",
     "HttpOnly",
@@ -1203,7 +1169,7 @@ function buildAnonCookie(id, url) {
 function buildSessionCookie(value, url) {
   return [
     `eden_session_id=${encodeURIComponent(value)}`,
-    "Max-Age=1800",
+    "Max-Age=1800",                // 30 minutes
     `Domain=${cookieDomain(url)}`,
     "Path=/",
     "Secure",
@@ -1213,7 +1179,7 @@ function buildSessionCookie(value, url) {
 
 
 // =============================================================================
-// URL HELPERS — UNCHANGED
+// URL HELPERS
 // =============================================================================
 
 function sanitizeUrl(url) {
@@ -1238,7 +1204,7 @@ function sanitizeUrlString(value) {
 
 
 // =============================================================================
-// CORS + RESPONSE HELPERS — UNCHANGED
+// CORS + RESPONSE HELPERS
 // =============================================================================
 
 function isAllowedOrigin(origin) {
