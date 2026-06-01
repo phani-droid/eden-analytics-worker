@@ -137,14 +137,14 @@
 
 // ─────────────────────────────────────────────────────────────────────────────
 // ALLOWED ORIGINS
-// Add new domain here AND in wrangler.toml routes → deploy
+// Production-only origins. Staging and Vercel preview origins are intentionally blocked.
+// Add new production domain here AND in wrangler.toml routes → deploy.
 // ─────────────────────────────────────────────────────────────────────────────
 
 const ALLOWED_ORIGINS = [
   "https://eden.health",
   "https://www.eden.health",
   "https://app.eden.health",
-  "https://eden-os-rimo-patient-staging.vercel.app",
 ];
 
 
@@ -266,7 +266,7 @@ export default {
           ok:                true,
           worker:            "eden-analytics",
           version:           "5.12",
-          hardening_version: "5.14-client-campaign-properties",
+          hardening_version: "5.16-universal-attribution-prod-only",
           ts:                nowUTC(),
           kv:                !!env.GCLID_KV,
           segment_write_key_configured: !!env.SEGMENT_WRITE_KEY,
@@ -1282,10 +1282,7 @@ function sanitizeUrlString(value) {
 
 function isAllowedOrigin(origin) {
   if (!origin) return false;
-  if (ALLOWED_ORIGINS.includes(origin)) return true;
-  // Allow ALL Eden Health Vercel preview deployments — hash changes every deploy
-  if (/^https:\/\/[a-z0-9-]+-eden-health\.vercel\.app$/.test(origin)) return true;
-  return false;
+  return ALLOWED_ORIGINS.includes(origin);
 }
 
 function corsHeadersObj(origin) {
