@@ -2,7 +2,7 @@
 # EdenOS Analytics Worker — GitHub Actions Deploy
 # ─────────────────────────────────────────────────────────────────────────────
 #
-# SECRETS TO ADD IN GITHUB (one time):
+# SECRETS REQUIRED IN GITHUB (one time):
 #   Repository → Settings → Secrets and variables → Actions → New repository secret
 #
 #   CLOUDFLARE_API_TOKEN   → from Cloudflare dashboard
@@ -10,6 +10,14 @@
 #
 # NOTE: SEGMENT_WRITE_KEY and SERVER_API_SECRET are stored directly in
 # Cloudflare via "wrangler secret put" — NOT in GitHub secrets.
+#
+# CHANGES vs previous:
+#   - pull_request trigger REMOVED — secrets not available in PR context
+#     from forks, causes exit code 1 failures
+#   - workflow_dispatch added — allows manual trigger from Actions tab
+#   - FORCE_JAVASCRIPT_ACTIONS_TO_NODE24 added — fixes Node.js deprecation
+#   - wrangler-action pinned to @v3 with explicit command: deploy
+#   - health check improved — shows full response on failure
 # ─────────────────────────────────────────────────────────────────────────────
 
 name: Deploy EdenOS Analytics Worker
@@ -18,31 +26,45 @@ on:
   push:
     branches:
       - main
-  pull_request:
-    branches:
-      - main
+  workflow_dispatch:   # manual trigger from GitHub Actions tab
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true  # suppress Node.js 20 warnings
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
     name: Deploy to Cloudflare Workers
-    steps:
 
-      # Step 1 — checkout code
+    # Only deploy on push to main — not on PRs
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+
+    steps:
+      # ── Step 1 — Checkout ─────────────────────────────────────────────────
       - name: Checkout code
         uses: actions/checkout@v4
 
-      # Step 2 — deploy to Cloudflare
+      # ── Step 2 — Deploy ───────────────────────────────────────────────────
       - name: Deploy to Cloudflare Workers
         uses: cloudflare/wrangler-action@v3
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: deploy    # explicit — prevents wrangler from guessing
 
-      # Step 3 — verify deployment
+      # ── Step 3 — Verify ───────────────────────────────────────────────────
       - name: Verify worker is live
         run: |
-          sleep 10
-          response=$(curl -s https://app.eden.health/eden-health-check)
+          echo "⏳ Waiting for propagation..."
+          sleep 15
+          response=$(curl -s --max-time 10 https://app.eden.health/eden-health-check)
           echo "Health check response: $response"
-          echo $response | grep -q '"ok":true' && echo "✅ Worker deployed successfully" || echo "⚠️ Health check failed — check Cloudflare dashboard"
+          if echo "$response" | grep -q '"version":"5.20"'; then
+            echo "✅ Worker v5.20 deployed and live"
+          elif echo "$response" | grep -q '"ok":true'; then
+            echo "⚠️ Worker live but version mismatch — check deployment"
+            exit 1
+          else
+            echo "🚨 Health check failed — worker may not be live"
+            exit 1
+          fi
