@@ -187,6 +187,17 @@ const CONVERSION_EVENTS = new Set([
   "reorder_completed",
 ]);
 
+// Accept common event-name variants without forcing backend changes.
+// Segment will receive the canonical names below, so dashboards stay consistent.
+const EVENT_NAME_ALIASES = {
+  "os_qualified_first_order": "OS_qualified_first_order",
+  "qualified_first_order":    "OS_qualified_first_order",
+  "os_purchase":              "OS_purchase",
+  "purchase":                 "OS_purchase",
+  "order_completed":          "order_completed",
+  "reorder_completed":        "reorder_completed",
+};
+
 
 // ─────────────────────────────────────────────────────────────────────────────
 // BOT DETECTION
@@ -257,6 +268,8 @@ export default {
           version:           "5.12",
           ts:                nowUTC(),
           kv:                !!env.GCLID_KV,
+          segment_write_key_configured: !!env.SEGMENT_WRITE_KEY,
+          server_secret_configured:     !!env.SERVER_API_SECRET,
           phi_stripping:     "disabled — BAA active — decisions at BQ dbt",
           gpc_handling:      "enabled — California/Virginia legal compliance",
           attribution_model: "first-touch — all 16 click IDs protected",
@@ -396,6 +409,8 @@ async function fireFirstTouch(request, env, anonId, session, url, clickIds, utms
   // Stable messageId — prevents first_touch double-firing on page refresh
   const messageId = `first_touch_${anonId}_${sessionId}`;
 
+  const campaignProps = buildCampaignContext(attribution);
+
   await segmentPost(env.SEGMENT_WRITE_KEY, "track", {
     anonymousId: anonId,
     messageId,
@@ -408,8 +423,15 @@ async function fireFirstTouch(request, env, anonId, session, url, clickIds, utms
       session_id:       sessionId,
       device_type:      isMobile(ua) ? "mobile" : "desktop",
       pipeline_version: "5.12",
+
+      // Duplicate campaign fields into properties for Mixpanel visibility.
+      ...campaignProps,
+      acquisition_channel: deriveAcquisitionChannel(campaignProps),
+      attribution_source:  campaignProps.utm_source || deriveClickIdSource(campaignProps),
+      attribution_medium:  campaignProps.utm_medium || undefined,
+      attribution_campaign: campaignProps.utm_campaign || undefined,
     },
-    context:   { campaign: buildCampaignContext(attribution) },
+    context:   { campaign: campaignProps },
     timestamp: nowUTC(),
   });
 }
@@ -508,10 +530,24 @@ async function handleServerCollect(request, env, ctx) {
   try { body = await request.json(); }
   catch { return new Response("Invalid JSON", { status: 400 }); }
 
-  const anonId    = body.anonymousId          || null;
-  const userId    = body.userId               || null;
-  const eventName = body.event                || "";
-  const orderId   = body.properties?.order_id || null;
+  if (!body.properties || typeof body.properties !== "object" || Array.isArray(body.properties)) {
+    body.properties = {};
+  }
+
+  const identity = resolveIdentityFromBody(request, body);
+
+  const anonId       = identity.anonymousId || null;
+  const userId       = identity.userId || null;
+  const rawEventName = resolveEventName(body);
+  const eventName    = canonicalizeEventName(rawEventName);
+  const orderId      = resolveOrderId(body);
+
+  // Normalize body once so all downstream Segment calls keep working
+  // without backend engineers needing to know camelCase vs snake_case.
+  if (eventName) body.event = eventName;
+  if (userId) body.userId = userId;
+  if (anonId) body.anonymousId = anonId;
+  if (orderId && !body.properties.order_id) body.properties.order_id = orderId;
 
   // Edge dedup — Layer 1 (Worker KV, 24hr window)
   // Covers: QFO double-fire, GA4+Segment overlap, Reverse ETL, Shippo retries
@@ -554,9 +590,12 @@ async function handleServerCollect(request, env, ctx) {
     portal:           "patient",
     source_type:      "server",
     pipeline_version: "5.12",
+    ...(identity.identityWarning ? { identity_warning: identity.identityWarning } : {}),
   };
 
-  const attribution = storedAttribution || {};
+  const attribution  = storedAttribution || {};
+  const campaignProps = buildCampaignContext(attribution);
+  enrichPropertiesWithAttribution(body.properties, campaignProps);
 
   if (env.SEGMENT_WRITE_KEY) {
     ctx.waitUntil(
@@ -601,8 +640,13 @@ async function handleIdentify(request, env, ctx) {
   try { body = await request.json(); }
   catch { return new Response("Invalid JSON", { status: 400 }); }
 
-  const anonId = body.anonymousId || null;
-  const userId = body.userId      || null;
+  const identity = resolveIdentityFromBody(request, body);
+
+  const anonId = identity.anonymousId || null;
+  const userId = identity.userId || null;
+
+  if (userId) body.userId = userId;
+  if (anonId) body.anonymousId = anonId;
 
   // Layer 3 — link userId → full attribution (all click IDs) in KV
   if (env.GCLID_KV && anonId && userId) {
@@ -664,7 +708,7 @@ async function forwardToSegment(writeKey, body, anonId, superProps, attribution 
     const traits = await hashEmail(body.traits || body.properties || {});
     await segmentPost(writeKey, "identify", {
       anonymousId: anonId,
-      userId:      body.userId || null,
+      userId:      resolveUserIdFromBody(body),
       traits,
       context:     mergedContext,
       timestamp:   nowUTC(),
@@ -678,7 +722,7 @@ async function forwardToSegment(writeKey, body, anonId, superProps, attribution 
   if (type === "page") {
     await segmentPost(writeKey, "page", {
       anonymousId: anonId,
-      userId:      body.userId || null,
+      userId:      resolveUserIdFromBody(body),
       name:        body.name   || body.properties?.name || "",
       properties:  await hashEmail({ ...superProps, ...(body.properties || {}) }),
       context:     mergedContext,
@@ -693,7 +737,7 @@ async function forwardToSegment(writeKey, body, anonId, superProps, attribution 
     const screenName = body.name || body.properties?.name || "Unknown Screen";
     await segmentPost(writeKey, "track", {
       anonymousId: anonId,
-      userId:      body.userId || null,
+      userId:      resolveUserIdFromBody(body),
       event:       `Viewed ${screenName}`,
       properties:  await hashEmail({ ...superProps, ...(body.properties || {}) }),
       context:     mergedContext,
@@ -706,10 +750,10 @@ async function forwardToSegment(writeKey, body, anonId, superProps, attribution 
   // FIX v5.6: validate event name — never send empty string to Segment
   // Empty event name → "Event did not have a name" → event dropped
   // Derive name from body.name or body.properties.name as fallback
-  const eventName = body.event
-    || body.name
-    || body.properties?.name
-    || null;
+  const eventName = canonicalizeEventName(resolveEventName(body)) || null;
+  const orderId = resolveOrderId(body);
+  if (eventName) body.event = eventName;
+  if (orderId && body.properties && !body.properties.order_id) body.properties.order_id = orderId;
 
   // Skip metrics and internal analytics.js calls with no meaningful name
   // These are performance telemetry — not business events
@@ -720,13 +764,13 @@ async function forwardToSegment(writeKey, body, anonId, superProps, attribution 
 
   // Layer 2 dedup for conversion events — stable messageId prevents Segment
   // double-delivery when same event arrives from two sources
-  const stableMessageId = CONVERSION_EVENTS.has(eventName) && body.properties?.order_id
-    ? `eden_${eventName}_${body.properties.order_id}`
+  const stableMessageId = CONVERSION_EVENTS.has(eventName) && orderId
+    ? `eden_${eventName}_${orderId}`
     : undefined;
 
   await segmentPost(writeKey, "track", {
     anonymousId: anonId,
-    userId:      body.userId || null,
+    userId:      resolveUserIdFromBody(body),
     event:       eventName,
     properties:  await hashEmail({ ...superProps, ...(body.properties || {}) }),
     context:     mergedContext,
@@ -741,6 +785,150 @@ async function forwardToSegment(writeKey, body, anonId, superProps, attribution 
 // Places all attribution in context.campaign per Segment spec
 // Confirmed by Segment Success Engineer George D. May 27 2026
 // ─────────────────────────────────────────────────────────────────────────────
+
+
+function canonicalizeEventName(eventName) {
+  if (!eventName) return "";
+  const raw = String(eventName).trim();
+  if (!raw) return "";
+  return EVENT_NAME_ALIASES[raw.toLowerCase()] || raw;
+}
+
+function resolveEventName(body) {
+  return (
+    body.event ||
+    body.event_name ||
+    body.name ||
+    body.properties?.event ||
+    body.properties?.event_name ||
+    body.properties?.name ||
+    ""
+  );
+}
+
+function resolveOrderId(body) {
+  return (
+    body.properties?.order_id ||
+    body.properties?.orderId ||
+    body.order_id ||
+    body.orderId ||
+    null
+  );
+}
+
+function resolveUserIdFromBody(body) {
+  return (
+    body.userId ||
+    body.user_id ||
+    body.properties?.userId ||
+    body.properties?.user_id ||
+    body.properties?.patient_id ||
+    body.properties?.customer_id ||
+    null
+  );
+}
+
+function resolveIdentityFromBody(request, body) {
+  const cookieAnonId =
+    readCookie(request, "eden_anon_id") ||
+    readCookie(request, "eden_anonymous_id");
+
+  const userId = resolveUserIdFromBody(body);
+
+  // Also accepts common misspellings because server payloads are not always consistent.
+  let anonymousId =
+    cookieAnonId ||
+    body.anonymousId ||
+    body.anonymous_id ||
+    body.anonymoous_id ||
+    body.properties?.anonymousId ||
+    body.properties?.anonymous_id ||
+    body.properties?.anonymoous_id ||
+    null;
+
+  // Segment needs anonymousId or userId. This fallback keeps delivery healthy.
+  // Perfect attribution still improves when /identify links cookie anonId -> userId.
+  if (!anonymousId && userId) anonymousId = userId;
+
+  return {
+    anonymousId,
+    userId,
+    identityWarning:
+      anonymousId && userId && anonymousId === userId
+        ? "anonymousId_equals_userId"
+        : undefined,
+  };
+}
+
+function deriveClickIdSource(campaign) {
+  if (!campaign) return undefined;
+
+  if (campaign.gclid || campaign.gbraid || campaign.wbraid || campaign.dclid) return "google";
+  if (campaign.fbclid) return "meta";
+  if (campaign.msclkid) return "microsoft";
+  if (campaign.ttclid) return "tiktok";
+  if (campaign.twclid) return "twitter";
+  if (campaign.li_fat_id) return "linkedin";
+  if (campaign.rdt_cid) return "reddit";
+  if (campaign.epik) return "pinterest";
+  if (campaign.ScCid) return "snapchat";
+  if (campaign.irclickid) return "impact_radius";
+  if (campaign.cjevent) return "cj_affiliate";
+  if (campaign.click_id) return "generic";
+
+  return undefined;
+}
+
+function deriveAcquisitionChannel(campaign) {
+  if (!campaign || Object.keys(campaign).length === 0) return "unknown";
+
+  const source = String(campaign.utm_source || deriveClickIdSource(campaign) || "").toLowerCase();
+  const medium = String(campaign.utm_medium || "").toLowerCase();
+
+  if (medium === "organic") return "organic_search";
+  if (medium === "email") return "email";
+  if (medium === "affiliate") return "affiliate";
+  if (medium === "influencer") return "influencer";
+
+  if (
+    medium === "cpc" || medium === "paid" || medium === "paid_search" ||
+    campaign.gclid || campaign.gbraid || campaign.wbraid || campaign.dclid ||
+    campaign.msclkid || source.includes("google") || source.includes("bing") || source.includes("microsoft")
+  ) {
+    return "paid_search";
+  }
+
+  if (
+    campaign.fbclid || campaign.ttclid ||
+    source.includes("facebook") || source.includes("instagram") ||
+    source.includes("meta") || source.includes("tiktok")
+  ) {
+    return "paid_social";
+  }
+
+  return source || "unknown";
+}
+
+function enrichPropertiesWithAttribution(properties, campaignProps) {
+  if (!properties || typeof properties !== "object") return;
+  if (!campaignProps || Object.keys(campaignProps).length === 0) return;
+
+  for (const [k, v] of Object.entries(campaignProps)) {
+    if (v && !properties[k]) properties[k] = v;
+  }
+
+  properties.acquisition_channel =
+    properties.acquisition_channel || deriveAcquisitionChannel(campaignProps);
+
+  properties.attribution_source =
+    properties.attribution_source || campaignProps.utm_source || deriveClickIdSource(campaignProps);
+
+  properties.attribution_medium =
+    properties.attribution_medium || campaignProps.utm_medium;
+
+  properties.attribution_campaign =
+    properties.attribution_campaign || campaignProps.utm_campaign;
+}
 
 function buildCampaignContext(attribution) {
   const campaign      = {};
