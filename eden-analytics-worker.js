@@ -266,6 +266,7 @@ export default {
           ok:                true,
           worker:            "eden-analytics",
           version:           "5.12",
+          hardening_version: "5.14-client-campaign-properties",
           ts:                nowUTC(),
           kv:                !!env.GCLID_KV,
           segment_write_key_configured: !!env.SEGMENT_WRITE_KEY,
@@ -467,24 +468,39 @@ async function handleCollect(request, env, ctx, url) {
   // Layer 1 — cookie is most reliable identity source
   const cookieAnonId = readCookie(request, "eden_anon_id")
                     || readCookie(request, "eden_anonymous_id");
-  const anonId       = cookieAnonId || body.anonymousId || crypto.randomUUID();
+  const anonId       = cookieAnonId || body.anonymousId || body.anonymous_id || crypto.randomUUID();
   const isNew        = !cookieAnonId;
   const portal       = origin.includes("app.eden.health") ? "patient" : "marketing";
-  const userId       = body.userId || null;
+  const userId       = resolveUserIdFromBody(body);
 
   // Layer 2 + 3 — resolve attribution from KV (parallel reads)
   const storedAttribution = (env.GCLID_KV && !gpcOptOut)
     ? await resolveAttribution(env.GCLID_KV, anonId, userId)
     : null;
 
-  // Fresh URL params always override stored (current session click is fresher)
+  // Fresh URL params always override stored (current session click is fresher).
+  // IMPORTANT v5.14 hardening:
+  // analytics.js may put Google attribution in body.context.campaign instead of
+  // body.properties. Google Ads Actions mappings commonly read properties.gclid,
+  // properties.gbraid, properties.wbraid. So we merge context.campaign into
+  // attribution and duplicate it into properties for downstream destinations
+  // like Google Ads and Mixpanel, while preserving context.campaign too.
   const freshClickIds = gpcOptOut ? {} : extractClickIds(url);
   const freshUTMs     = gpcOptOut ? null : extractUTMs(url);
+  const contextCampaign = gpcOptOut ? {} : ((body.context || {}).campaign || {});
   const attribution   = {
     ...(storedAttribution || {}),
+    ...contextCampaign,
     ...(freshUTMs         || {}),
     ...freshClickIds,
   };
+
+  if (!body.properties || typeof body.properties !== "object" || Array.isArray(body.properties)) {
+    body.properties = {};
+  }
+
+  const campaignProps = buildCampaignContext(attribution);
+  enrichPropertiesWithAttribution(body.properties, campaignProps);
 
   const superProps = {
     portal,
@@ -593,7 +609,13 @@ async function handleServerCollect(request, env, ctx) {
     ...(identity.identityWarning ? { identity_warning: identity.identityWarning } : {}),
   };
 
-  const attribution  = storedAttribution || {};
+  // Also honor campaign fields if a server event payload includes context.campaign.
+  // Stored KV attribution is still used; explicit context.campaign can fill/override
+  // missing campaign identifiers for Google Ads destination mappings.
+  const attribution  = {
+    ...(storedAttribution || {}),
+    ...((body.context || {}).campaign || {}),
+  };
   const campaignProps = buildCampaignContext(attribution);
   enrichPropertiesWithAttribution(body.properties, campaignProps);
 
