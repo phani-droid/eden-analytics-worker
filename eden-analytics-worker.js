@@ -1,6 +1,21 @@
 // =============================================================================
-// EdenOS Analytics Worker — v5.7 (PRODUCTION)
+// EdenOS Analytics Worker — v5.8 (PRODUCTION)
 // =============================================================================
+//
+// FIXES IN v5.8 vs v5.7:
+//
+//   FIX 7 — Bridge logic missing from /collect handler (CRITICAL)
+//     Root cause: OS_purchase fires CLIENT-SIDE via analytics.js → /collect
+//     v5.7 bridge was only in handleServerCollect → never triggered for
+//     OS_purchase → attr:user and attr:order were never written to KV →
+//     OS_order_delivered still couldn't resolve gclid → still 0 conversions.
+//
+//     Fix: Bridge logic added to handleCollect identically to handleServerCollect.
+//     At OS_purchase in /collect:
+//       → writes attr:user:{userId}   (fixes all future server events)
+//       → writes attr:order:{orderId} (direct fallback for OS_order_delivered)
+//     handleServerCollect bridge retained for any server-fired OS_purchase.
+//     All conditions identical: requires storedAttribution with click ID present.
 //
 // FIXES IN v5.7 vs v5.6:
 //
@@ -15,19 +30,14 @@
 //       Priority: attr:anon → attr:user → attr:order
 //       Parallel reads (Promise.all) — no latency impact
 //
-//     Fix B — At OS_purchase (client-side, has anonId + gclid):
-//       Worker now writes TWO additional KV keys:
+//     Fix B — At OS_purchase (server-side path):
+//       Worker writes TWO additional KV keys:
 //         attr:user:{userId}   → attribution (fixes all future server events)
 //         attr:order:{orderId} → attribution (order-level fallback)
-//       OS_purchase confirmed to have anonymousId + gclid in Mixpanel/Segment.
 //       storeAttribution() first-touch rule still applies — no overwrites.
 //
 //     Fix C — At OS_order_delivered (server-side, has userId):
-//       If attribution resolved via attr:order fallback,
-//       also writes attr:user:{userId} for future server events from same user.
-//
-//     NO CHANGES to any other handler, route, cookie, KV schema, or logic.
-//     All v5.6 fixes fully retained. Zero impact on existing architecture.
+//       If attribution resolved, also writes attr:user:{userId} for future events.
 //
 // ALL PREVIOUS FIXES RETAINED:
 //   v5.6 FIX 1 — "Event did not have a name" — page/identify/screen routing
@@ -193,8 +203,8 @@ export default {
         return jsonResponse({
           ok:                true,
           worker:            "eden-analytics",
-          version:           "5.17",
-          hardening_version: "5.17-order-bridge-prod-only",
+          version:           "5.18",
+          hardening_version: "5.18-collect-bridge-prod-only",
           ts:                nowUTC(),
           kv:                !!env.GCLID_KV,
           segment_write_key_configured: !!env.SEGMENT_WRITE_KEY,
@@ -208,7 +218,7 @@ export default {
           collect_subpaths:  "enabled — /collect /collect/p /collect/t /collect/m",
           event_naming:      "fixed — no more empty event names",
           page_inflation:    "fixed — worker does not fire page_viewed",
-          order_bridge:      "enabled v5.7 — OS_purchase writes attr:order + attr:user",
+          order_bridge:      "enabled v5.8 — OS_purchase bridge in /collect + /server-collect",
           routes:            ["eden.health/*", "www.eden.health/*", "app.eden.health/*"],
           channels:          CLICK_ID_CONFIG.map(c => c.label),
         });
@@ -399,6 +409,41 @@ async function handleCollect(request, env, ctx, url) {
     gpc_opt_out:      gpcOptOut,
     pipeline_version: "5.17",
   };
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // v5.7 BRIDGE — also runs in handleCollect because OS_purchase is CLIENT-SIDE
+  // analytics.js fires OS_purchase → /collect (not /server-collect)
+  // So the bridge must live here too, not only in handleServerCollect.
+  // Identical logic: writes attr:user + attr:order at OS_purchase time.
+  // ─────────────────────────────────────────────────────────────────────────
+  const collectEventName = canonicalizeEventName(resolveEventName(body));
+  const collectOrderId   = resolveOrderId(body);
+  const collectUserId    = resolveUserIdFromBody(body);
+
+  if (
+    env.GCLID_KV &&
+    collectEventName === "OS_purchase" &&
+    attribution &&
+    CLICK_ID_PARAMS.some(p => attribution[p])
+  ) {
+    ctx.waitUntil(
+      Promise.all([
+        collectUserId ? storeAttribution(
+          env.GCLID_KV,
+          KV_USER_PREFIX + collectUserId,
+          attribution
+        ).catch(err => console.error("[eden-analytics] collect purchase user-link error:", err))
+        : Promise.resolve(),
+
+        collectOrderId ? storeAttribution(
+          env.GCLID_KV,
+          KV_ORDER_PREFIX + collectOrderId,
+          attribution
+        ).catch(err => console.error("[eden-analytics] collect purchase order-link error:", err))
+        : Promise.resolve(),
+      ])
+    );
+  }
 
   if (env.SEGMENT_WRITE_KEY) {
     ctx.waitUntil(
