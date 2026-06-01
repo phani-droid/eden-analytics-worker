@@ -136,7 +136,10 @@ const EVENT_NAME_ALIASES = {
 
 
 // ─────────────────────────────────────────────────────────────────────────────
-// BOT DETECTION — UNCHANGED
+// BOT DETECTION
+// v5.8: added Checkly synthetic monitor detection
+//   Checkly injects fake click IDs (checkly-vwo-gclid etc.) which cause
+//   UNPARSEABLE_GCLID errors in Google Ads. Block at worker level.
 // ─────────────────────────────────────────────────────────────────────────────
 
 const BOT_UA_PATTERNS = [
@@ -144,6 +147,7 @@ const BOT_UA_PATTERNS = [
   /lighthouse/i, /pagespeed/i, /playwright/i,
   /puppeteer/i, /preview/i, /prerender/i,
   /google-inspectiontool/i,
+  /checklyhq/i,   // NEW v5.8 — Checkly synthetic monitors
 ];
 
 const BOT_CF_DECISIONS = new Set([
@@ -203,8 +207,9 @@ export default {
         return jsonResponse({
           ok:                true,
           worker:            "eden-analytics",
-          version:           "5.18",
-          hardening_version: "5.18-collect-bridge-prod-only",
+          version:           "5.20",
+          hardening_version: "5.20-checkly-block-prod-only",
+          synthetic_monitor_block: "enabled — Checkly fake gclid pollution prevented",
           ts:                nowUTC(),
           kv:                !!env.GCLID_KV,
           segment_write_key_configured: !!env.SEGMENT_WRITE_KEY,
@@ -234,6 +239,12 @@ export default {
 
       // ── Skip bots ─────────────────────────────────────────────────────────
       if (isBot(request)) return fetch(request);
+
+      // ── Skip synthetic monitors (Checkly) — prevent fake gclid pollution ──
+      if (isSyntheticMonitor(request, url)) {
+        console.log("[eden-analytics] synthetic monitor blocked:", url.searchParams.get("utm_source") || "unknown");
+        return fetch(request);
+      }
 
       // ── Skip static assets ────────────────────────────────────────────────
       if (isStaticAsset(url)) return fetch(request);
@@ -419,6 +430,20 @@ async function handleCollect(request, env, ctx, url) {
   const collectEventName = canonicalizeEventName(resolveEventName(body));
   const collectOrderId   = resolveOrderId(body);
   const collectUserId    = resolveUserIdFromBody(body);
+
+  // DEBUG v5.8 — remove after confirming attr:user + attr:order appear in KV
+  if (collectEventName === "OS_purchase") {
+    console.log("[eden-analytics][debug] OS_purchase in /collect", {
+      collectEventName,
+      collectUserId,
+      collectOrderId,
+      anonId,
+      hasAttribution:    !!attribution,
+      attributionKeys:   attribution ? Object.keys(attribution) : [],
+      hasClickId:        attribution ? CLICK_ID_PARAMS.some(p => attribution[p]) : false,
+      clickIdsFound:     attribution ? CLICK_ID_PARAMS.filter(p => attribution[p]) : [],
+    });
+  }
 
   if (
     env.GCLID_KV &&
@@ -1105,11 +1130,26 @@ async function segmentPost(writeKey, endpoint, payload) {
 }
 
 
-// =============================================================================
-// BOT DETECTION — UNCHANGED
-// =============================================================================
+// ─────────────────────────────────────────────────────────────────────────────
+// SYNTHETIC MONITOR DETECTION
+// Detects Checkly and other synthetic monitors by URL marker or UA
+// Prevents fake click IDs from polluting KV and Google Ads
+// ─────────────────────────────────────────────────────────────────────────────
 
-function isBot(request) {
+function isSyntheticMonitor(request, url) {
+  // Checkly injects eden_checkly_marker into URLs
+  if (url.searchParams.has("eden_checkly_marker")) return true;
+  // Checkly utm_medium=synthetic
+  if (url.searchParams.get("utm_medium") === "synthetic") return true;
+  // Checkly source
+  if ((url.searchParams.get("utm_source") || "").includes("checkly")) return true;
+  // UA check (backup)
+  const ua = request.headers.get("User-Agent") || "";
+  if (/checklyhq/i.test(ua)) return true;
+  return false;
+}
+
+
   const ua = request.headers.get("User-Agent") || "";
   if (BOT_UA_PATTERNS.some(p => p.test(ua))) return true;
   const decision = request.cf?.botManagement?.decision;
