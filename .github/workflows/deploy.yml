@@ -2,22 +2,22 @@
 # EdenOS Analytics Worker — GitHub Actions Deploy
 # ─────────────────────────────────────────────────────────────────────────────
 #
-# SECRETS REQUIRED IN GITHUB (one time):
+# SECRETS REQUIRED IN GITHUB (one time setup):
 #   Repository → Settings → Secrets and variables → Actions → New repository secret
 #
-#   CLOUDFLARE_API_TOKEN   → from Cloudflare dashboard
-#   CLOUDFLARE_ACCOUNT_ID  → from Cloudflare dashboard
+#   CLOUDFLARE_API_TOKEN   → from Cloudflare dashboard → My Profile → API Tokens
+#   CLOUDFLARE_ACCOUNT_ID  → from Cloudflare dashboard → right sidebar
 #
 # NOTE: SEGMENT_WRITE_KEY and SERVER_API_SECRET are stored directly in
 # Cloudflare via "wrangler secret put" — NOT in GitHub secrets.
 #
-# CHANGES vs previous:
-#   - pull_request trigger REMOVED — secrets not available in PR context
-#     from forks, causes exit code 1 failures
-#   - workflow_dispatch added — allows manual trigger from Actions tab
-#   - FORCE_JAVASCRIPT_ACTIONS_TO_NODE24 added — fixes Node.js deprecation
-#   - wrangler-action pinned to @v3 with explicit command: deploy
-#   - health check improved — shows full response on failure
+# TRIGGERS:
+#   - push to main        → auto deploy
+#   - workflow_dispatch   → manual trigger from GitHub Actions tab
+#
+# VERSION CHECK:
+#   Checks ok:true only — no hardcoded version string.
+#   Future version bumps deploy without any yaml changes.
 # ─────────────────────────────────────────────────────────────────────────────
 
 name: Deploy EdenOS Analytics Worker
@@ -26,20 +26,19 @@ on:
   push:
     branches:
       - main
-  workflow_dispatch:   # manual trigger from GitHub Actions tab
+  workflow_dispatch:  # manual trigger from GitHub Actions tab
 
 env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true  # suppress Node.js 20 warnings
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true  # suppress Node.js deprecation warnings
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
     name: Deploy to Cloudflare Workers
-
-    # Only deploy on push to main — not on PRs
     if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
 
     steps:
+
       # ── Step 1 — Checkout ─────────────────────────────────────────────────
       - name: Checkout code
         uses: actions/checkout@v4
@@ -50,21 +49,24 @@ jobs:
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          command: deploy    # explicit — prevents wrangler from guessing
+          command: deploy
 
       # ── Step 3 — Verify ───────────────────────────────────────────────────
+      # Checks ok:true only — no hardcoded version string
+      # Future deploys (v5.23, v5.24 etc.) work without changing this file
       - name: Verify worker is live
         run: |
-          echo "⏳ Waiting for propagation..."
+          echo "⏳ Waiting 15s for Cloudflare propagation..."
           sleep 15
+
           response=$(curl -s --max-time 10 https://app.eden.health/eden-health-check)
           echo "Health check response: $response"
-          if echo "$response" | grep -q '"version":"5.20"'; then
-            echo "✅ Worker v5.20 deployed and live"
-          elif echo "$response" | grep -q '"ok":true'; then
-            echo "⚠️ Worker live but version mismatch — check deployment"
-            exit 1
+
+          if echo "$response" | grep -q '"ok":true'; then
+            version=$(echo "$response" | grep -o '"version":"[^"]*"' | head -1)
+            echo "✅ Worker live — $version"
           else
             echo "🚨 Health check failed — worker may not be live"
+            echo "Response was: $response"
             exit 1
           fi
