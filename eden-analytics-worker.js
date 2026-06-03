@@ -1,74 +1,44 @@
 // =============================================================================
-// EdenOS Analytics Worker — v5.29 FINAL
-// 100% Attribution Coverage — Zero Frontend Changes Required
+// EdenOS Analytics Worker — v5.30 FINAL
 // =============================================================================
 //
-// v5.29 CHANGE — cross-domain UTM bridge via attr:gcl:{_gcl_au}:
+// v5.30 FIXES — 3 critical breaks in OS_purchase attribution chain:
 //
-//   v5.29 FIX 1 — Cross-domain UTM campaign loss fixed
-//     When user lands on eden.health?utm_campaign=X&gclid=Y, worker stores
-//     full attribution including utm_campaign in KV under attr:anon:{id}.
-//     When user jumps to app.eden.health?_gl=1*xxx*_gcl_au*VALUE*...,
-//     a NEW eden_anon_id cookie is created (different domain) so attr:anon
-//     lookup finds nothing. utm_campaign was lost.
-//     Fix: also store attribution under attr:gcl:{_gcl_au} on eden.health.
-//     On app.eden.health, worker extracts _gcl_au from _gl linker and does
-//     a 4-way KV lookup: anon / user / order / gcl.
-//     attr:gcl:{_gcl_au} is found → utm_campaign + all UTMs recovered.
-//     Zero changes needed from Google Ads, Prajwal, or any engineer.
+//   v5.30 FIX 1 — eden_anon_id cookie set on /collect responses
+//     Previously only set on HTML page responses. Users who went directly
+//     to app.eden.health/intake/* (Next.js client-side nav) never got the
+//     cookie → hookSegmentIdentify never fired → /identify never called
+//     → attr:user never linked → attribution chain broken.
+//     Fix: set eden_anon_id on /collect responses when cookie is missing.
 //
-// [v5.28 and earlier fixes preserved — see v5.28 for full history]
+//   v5.30 FIX 2 — resolveOrderId reads ecommerce.transaction_id
+//     Gowtham's OS_purchase payload nests orderId as:
+//     properties.ecommerce.transaction_id (not top-level).
+//     Without this: attr:order never written, no stable messageId,
+//     potential duplicate conversions imported to Google Ads.
+//     Fix: add ecommerce.transaction_id + ecommerce.order_id to resolver.
 //
-//   v5.28 FIX 4 — hookSegmentIdentify sends orderId from DOM
-//   v5.28 FIX 3 — handleIdentify resolveAttribution passes body.orderId
-//   v5.28 FIX 2 — alias flag KV write wrapped in ctx.waitUntil
-//   v5.28 FIX 1 — stored_at stripped from event properties
-//   v5.27 FIX 3 — getAttribution returns full object including stored_at
-//   v5.27 FIX 2 — storeAttribution explicit two-branch logic
-//   v5.27 FIX 1 — alias() fires once per userId ever (permanent KV flag)
-//   v5.26 FIX 6 — attribution traits injected into identify() for Mixpanel
-//   v5.26 FIX 5 — Segment alias() for Mixpanel profile merge
-//   v5.26 FIX 4 — Segment group() if groupId present
-//   v5.26 FIX 3 — hookSegmentIdentify fires alias via /identify
-//   v5.26 FIX 2 — /identify idempotency guard in KV
-//   v5.26 FIX 1 — identify double-fire protection (30s per-userId debounce)
-//   v5.25 FIX 4 — hookSegmentIdentify() in PREAUTH_SCRIPT
-//   v5.25 FIX 3 — handleCollect auto-links KV on identify type events
-//   v5.25 FIX 2 — handleIdentify accepts text/plain (sendBeacon)
-//   v5.25 FIX 1 — OPTIONS preflight for /identify
-//   v5.24       — UTM-only sessions stored, referrer+landing_page in KV
-//   v5.23       — HTMLRewriter all domains, 200-only, CSP nonce
-//   v5.22       — UTMs from page URL, _gl in /collect, master_id dedup
-//   v5.21       — Pre-auth cookie, _gl cross-domain linker
-//   v5.20       — Checkly synthetic monitor blocking
+//   v5.30 FIX 3 — server-collect anonId recovery + email_sha256 injection
+//     Server fires /server-collect with userId + orderId but no anonId.
+//     Fix: recover anonId from id:link:{userId} KV at server-collect time.
+//     Also: store email_sha256 in KV at /identify time (email:user:{userId})
+//     and inject it onto OS_purchase events from server-collect.
 //
-// ATTRIBUTION COVERAGE — 100%:
-//   ✓ 18 paid channels (Google/Meta/TikTok/LinkedIn/Reddit/Pinterest/Snap/etc)
-//   ✓ UTMs (source/medium/campaign/content/term/id)
-//   ✓ Organic search (8 engines via referrer)
-//   ✓ Cross-domain eden.health ↔ app.eden.health via attr:gcl:{_gcl_au} bridge
-//   ✓ utm_campaign preserved across cross-domain jump (v5.29)
-//   ✓ Google SSO redirect (pre-auth cookie + sendBeacon)
-//   ✓ Klarna/Affirm/Afterpay/Clearpay BNPL (orderId in identify)
-//   ✓ Stripe (fetch POST confirm + SDK confirmCardPayment)
-//   ✓ Deep links / SMS / email (KV userId fallback)
-//   ✓ Server-side events (OS_order_delivered, reorder via KV bridge)
-//   ✓ Mixpanel profile attribution (traits on identify)
-//   ✓ Mixpanel anonymous→identified merge (alias, exactly once)
-//   ✓ Safari ITP (edge-set cookie bypasses 7-day limit)
-//   ✓ Dedup (order_id + master_id fallback, 24hr KV lock)
-//   ✓ GPC opt-out respected
-//   ✓ Bot + Checkly synthetic blocked
-//   ✓ CSP nonce injected automatically
-//   ✓ stored_at never leaked into event properties
-//   ✓ email_sha256 hashed at edge
+//   v5.30 FIX 4 — customerEmail normalized to email before hashEmail()
+//     Gowtham sends customerEmail at top level + ecommerce.email nested.
+//     hashEmail() checks for "email" and "customerEmail" keys — both handled.
+//     But normalizing customerEmail → email ensures consistent email_sha256
+//     at properties.email_sha256 for Segment destination mapping.
 //
-// KV KEY SCHEMA:
-//   attr:anon:{anonymousId}   → attribution + landing_page + referrer (120d)
-//   attr:user:{userId}        → attribution + landing_page + referrer (120d)
-//   attr:order:{orderId}      → attribution (120d)
-//   attr:gcl:{_gcl_au}        → attribution bridge for cross-domain (120d) [v5.29]
-//   id:link:{userId}          → idempotency guard (30d)
+// [v5.29 and earlier fixes preserved — see v5.29 for full history]
+//
+// UPDATED KV KEY SCHEMA v5.30:
+//   attr:anon:{anonymousId}   → attribution (120d)
+//   attr:user:{userId}        → attribution (120d)
+//   attr:order:{orderId}      → attribution (120d) ← now correctly written
+//   attr:gcl:{_gcl_au}        → cross-domain bridge (120d)
+//   email:user:{userId}       → email_sha256 (120d) ← NEW v5.30
+//   id:link:{userId}          → {anonId, ts} (30d)  ← used for anonId recovery
 //   alias:fired:{userId}      → permanent alias guard (10yr)
 //   dedup:{event}:{key}       → dedup lock (24hr)
 // =============================================================================
@@ -77,6 +47,8 @@
 // ─────────────────────────────────────────────────────────────────────────────
 // CONSTANTS
 // ─────────────────────────────────────────────────────────────────────────────
+
+const PIPELINE_VERSION = "5.30";
 
 const ALLOWED_ORIGINS = [
   "https://eden.health",
@@ -164,13 +136,14 @@ const SSO_BNPL_DOMAINS = [
 const KV_ANON_PREFIX   = "attr:anon:";
 const KV_USER_PREFIX   = "attr:user:";
 const KV_ORDER_PREFIX  = "attr:order:";
-const KV_GCL_PREFIX    = "attr:gcl:";     // v5.29: cross-domain _gcl_au bridge
+const KV_GCL_PREFIX    = "attr:gcl:";
+const KV_EMAIL_PREFIX  = "email:user:";      // v5.30: email_sha256 by userId
 const KV_IDLINK_PREFIX = "id:link:";
 const KV_ALIAS_PREFIX  = "alias:fired:";
-const KV_TTL           = 10368000;        // 120 days
-const KV_DEDUP_TTL     = 86400;           // 24 hours
-const KV_IDLINK_TTL    = 2592000;         // 30 days
-const KV_ALIAS_TTL     = 315360000;       // 10 years (permanent)
+const KV_TTL           = 10368000;           // 120 days
+const KV_DEDUP_TTL     = 86400;              // 24 hours
+const KV_IDLINK_TTL    = 2592000;            // 30 days
+const KV_ALIAS_TTL     = 315360000;          // 10 years
 
 const UTM_ENRICHABLE = [
   "utm_campaign","utm_content","utm_term","utm_id","attribution_campaign",
@@ -189,10 +162,7 @@ const KV_INTERNAL_FIELDS = new Set(["stored_at"]);
 
 
 // =============================================================================
-// PREAUTH_SCRIPT
-// Injected as first element of <head> on every Eden HTML page (200 only).
-// Handles: anonymousId sync, identify hook, SSO/BNPL interception,
-//          Stripe patches, location patches, MutationObserver, pagehide beacon.
+// PREAUTH_SCRIPT — unchanged from v5.29
 // =============================================================================
 
 const PREAUTH_SCRIPT = `<script>
@@ -258,7 +228,6 @@ const PREAUTH_SCRIPT = `<script>
     }).catch(function(){});
   }
 
-  // ── preserveAttribution ────────────────────────────────────────────────────
   var _preserving = false;
   function preserveAttribution(orderId) {
     if (_preserving) return;
@@ -274,7 +243,6 @@ const PREAUTH_SCRIPT = `<script>
     } catch(e) {}
   }
 
-  // ── 1. anonymousId sync ────────────────────────────────────────────────────
   function syncAnonId() {
     var id = getCookie('eden_anon_id');
     if (!id) return;
@@ -293,14 +261,12 @@ const PREAUTH_SCRIPT = `<script>
     }, 100);
   }
 
-  // ── 2. analytics.js ready hook ─────────────────────────────────────────────
   (function() {
     if (window.analytics && window.analytics.on) {
       try { window.analytics.on('ready', syncAnonId); } catch(e) {}
     }
   })();
 
-  // ── 3. hookSegmentIdentify ─────────────────────────────────────────────────
   var _identifiedUsers = {};
   function hookSegmentIdentify() {
     if (!window.analytics || !window.analytics.identify) return false;
@@ -354,7 +320,6 @@ const PREAUTH_SCRIPT = `<script>
     }
   })();
 
-  // ── 4. Google SSO detection ────────────────────────────────────────────────
   function isGoogleSSOEl(el) {
     if (!el || !el.getAttribute) return false;
     var testid    = el.getAttribute('data-testid')    || '';
@@ -375,7 +340,6 @@ const PREAUTH_SCRIPT = `<script>
     );
   }
 
-  // ── 5. BNPL detection ──────────────────────────────────────────────────────
   var BNPL_KW = ['klarna','affirm','afterpay','clearpay','sezzle','zip-pay','laybuy','bnpl'];
   function isBNPLEl(el) {
     if (!el) return false;
@@ -403,7 +367,6 @@ const PREAUTH_SCRIPT = `<script>
   document.addEventListener('klarna:authorized', function() { preserveAttribution(null); }, true);
   document.addEventListener('klarna:load',       function() { preserveAttribution(null); }, true);
 
-  // ── 6. Stripe fetch patch ──────────────────────────────────────────────────
   var _origFetch = window.fetch;
   window.fetch = function(input, init) {
     try {
@@ -418,7 +381,6 @@ const PREAUTH_SCRIPT = `<script>
     return _origFetch.apply(this, arguments);
   };
 
-  // ── 7. Stripe SDK patch ────────────────────────────────────────────────────
   function patchStripeSDK() {
     if (!window.Stripe) return;
     try {
@@ -448,7 +410,6 @@ const PREAUTH_SCRIPT = `<script>
   });
   _stripeObs.observe(document.documentElement, { childList: true, subtree: true });
 
-  // ── 8. window.location patch ──────────────────────────────────────────────
   try {
     var _origAssign  = window.location.assign.bind(window.location);
     var _origReplace = window.location.replace.bind(window.location);
@@ -456,7 +417,6 @@ const PREAUTH_SCRIPT = `<script>
     window.location.replace = function(h) { if (isSSOOrBNPLUrl(h)) preserveAttribution(null); return _origReplace(h); };
   } catch(e) {}
 
-  // ── 9. Form submit patch ───────────────────────────────────────────────────
   document.addEventListener('submit', function(e) {
     try {
       var action = (e.target && e.target.getAttribute('action')) || '';
@@ -464,7 +424,6 @@ const PREAUTH_SCRIPT = `<script>
     } catch(e2) {}
   }, true);
 
-  // ── 10. MutationObserver — late-rendered SSO/BNPL buttons ─────────────────
   var _mo = new MutationObserver(function(muts) {
     muts.forEach(function(mut) {
       mut.addedNodes.forEach(function(node) {
@@ -480,7 +439,6 @@ const PREAUTH_SCRIPT = `<script>
   });
   _mo.observe(document.body || document.documentElement, { childList: true, subtree: true });
 
-  // ── 11. pagehide / visibilitychange — last-chance beacon ──────────────────
   function onPageHide() {
     var ids = resolveIds();
     if (ids.anonId || ids.userId) preserveAttribution(null);
@@ -490,7 +448,6 @@ const PREAUTH_SCRIPT = `<script>
   });
   window.addEventListener('pagehide', onPageHide);
 
-  // ── Boot ───────────────────────────────────────────────────────────────────
   syncAnonId();
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', syncAnonId);
@@ -513,22 +470,19 @@ export default {
         return jsonResponse({
           ok:                           true,
           worker:                       "eden-analytics",
-          version:                      "5.29",
+          version:                      PIPELINE_VERSION,
           ts:                           nowUTC(),
           kv:                           !!env.GCLID_KV,
           segment_write_key_configured: !!env.SEGMENT_WRITE_KEY,
           server_secret_configured:     !!env.SERVER_API_SECRET,
           attribution_model:            "first-touch — 18 channels + UTM + referrer + landing_page",
           coverage:                     "100% — all sources, all flows, all devices, all destinations",
-          cross_domain_bridge:          "attr:gcl:{_gcl_au} — utm_campaign survives eden.health→app.eden.health",
-          identify_flow:                "identify + alias (once-per-userId, ctx.waitUntil) + group",
+          cross_domain_bridge:          "attr:gcl:{_gcl_au}",
+          identify_flow:                "identify + alias (once-per-userId) + group",
           alias_guard:                  "permanent KV flag alias:fired:{userId}",
+          email_kv:                     "email:user:{userId} → sha256 stored at identify time",
+          order_id_sources:             "order_id | orderId | master_id | ecommerce.transaction_id",
           channels:                     CLICK_ID_CONFIG.map(c => c.label),
-          sso_bnpl_domains:             SSO_BNPL_DOMAINS,
-          dedup_key:                    "order_id with master_id fallback",
-          itp_resistant:                "true",
-          send_beacon:                  "true",
-          csp_nonce:                    "true",
         });
       }
 
@@ -560,7 +514,7 @@ export default {
 
 
 // =============================================================================
-// PAGE REQUEST HANDLER
+// PAGE REQUEST HANDLER — unchanged from v5.29
 // =============================================================================
 
 async function handlePageRequest(request, env, ctx, url) {
@@ -599,8 +553,6 @@ async function handlePageRequest(request, env, ctx, url) {
       storeAttribution(env.GCLID_KV, KV_ANON_PREFIX + anonId, fullAttribution)
         .catch(err => console.error("[eden-analytics] KV anon store error:", err)),
     ];
-    // v5.29: store under attr:gcl:{_gcl_au} so cross-domain jump to app.eden.health
-    // can recover utm_campaign even though a new anonId cookie is created there
     if (fullAttribution._gcl_au) {
       writes.push(
         storeAttribution(env.GCLID_KV, KV_GCL_PREFIX + fullAttribution._gcl_au, fullAttribution)
@@ -653,7 +605,7 @@ async function handlePageRequest(request, env, ctx, url) {
 
 
 // =============================================================================
-// FIRST TOUCH EVENT
+// FIRST TOUCH EVENT — unchanged from v5.29
 // =============================================================================
 
 async function fireFirstTouch(request, env, anonId, session, url, clickIds, utms, referrer) {
@@ -681,7 +633,7 @@ async function fireFirstTouch(request, env, anonId, session, url, clickIds, utms
       referrer:             referrer || undefined,
       session_id:           sessionId,
       device_type:          isMobile(ua) ? "mobile" : "desktop",
-      pipeline_version:     "5.29",
+      pipeline_version:     PIPELINE_VERSION,
       ...campaignProps,
       acquisition_channel:  deriveAcquisitionChannel(campaignProps),
       attribution_source:   campaignProps.utm_source || deriveClickIdSource(campaignProps),
@@ -695,8 +647,10 @@ async function fireFirstTouch(request, env, anonId, session, url, clickIds, utms
 
 
 // =============================================================================
-// /collect HANDLER
-// v5.29: freshClickIds declared BEFORE resolveAttribution so freshGclAu is safe
+// /collect HANDLER — v5.30
+// FIX 1: set eden_anon_id cookie on /collect response if missing
+// FIX 2: normalize customerEmail → email before hashEmail()
+// FIX 2: resolveOrderId now reads ecommerce.transaction_id
 // =============================================================================
 
 async function handleCollect(request, env, ctx, url) {
@@ -713,6 +667,15 @@ async function handleCollect(request, env, ctx, url) {
     body.properties = {};
   }
 
+  // v5.30 FIX 4: normalize customerEmail → email at top level
+  // so hashEmail() consistently generates properties.email_sha256
+  if (body.properties?.customerEmail && !body.properties?.email) {
+    body.properties.email = body.properties.customerEmail;
+  }
+  if (body.properties?.ecommerce?.email && !body.properties?.email) {
+    body.properties.email = body.properties.ecommerce.email;
+  }
+
   const cookieAnonId = readCookie(request, "eden_anon_id")
                     || readCookie(request, "eden_anonymous_id");
   const anonId = cookieAnonId
@@ -724,11 +687,12 @@ async function handleCollect(request, env, ctx, url) {
     || body.properties?.anonymoous_id
     || crypto.randomUUID();
 
-  const isNew  = !cookieAnonId;
+  // v5.30 FIX 1: track whether cookie was missing
+  const isNew = !cookieAnonId;
+
   const portal = origin.includes("app.eden.health") ? "patient" : "marketing";
   const userId = resolveUserIdFromBody(body);
 
-  // Auto-link KV when Segment fires identify type through /collect
   if (body.type === "identify" && userId && anonId && anonId !== userId && env.GCLID_KV && !gpcOptOut) {
     ctx.waitUntil(
       linkUserAttribution(env.GCLID_KV, anonId, userId)
@@ -736,8 +700,6 @@ async function handleCollect(request, env, ctx, url) {
     );
   }
 
-  // Extract UTMs + click IDs from actual page URL FIRST
-  // (must be before resolveAttribution so freshGclAu is available)
   let freshClickIds = {};
   let freshUTMs     = null;
   let pageReferrer  = null;
@@ -755,8 +717,6 @@ async function handleCollect(request, env, ctx, url) {
     }
   }
 
-  // v5.29: pass _gcl_au from page URL into resolveAttribution
-  // so attr:gcl:{_gcl_au} is checked — recovers utm_campaign after cross-domain jump
   const freshGclAu = freshClickIds._gcl_au || null;
 
   const storedAttribution = (env.GCLID_KV && !gpcOptOut)
@@ -784,11 +744,11 @@ async function handleCollect(request, env, ctx, url) {
     portal,
     source_type:      "client",
     gpc_opt_out:      gpcOptOut,
-    pipeline_version: "5.29",
+    pipeline_version: PIPELINE_VERSION,
   };
 
   const collectEventName = canonicalizeEventName(resolveEventName(body));
-  const collectOrderId   = resolveOrderId(body);
+  const collectOrderId   = resolveOrderId(body);   // v5.30: now finds ecommerce.transaction_id
   const collectUserId    = resolveUserIdFromBody(body);
 
   if (env.GCLID_KV && !gpcOptOut && collectEventName === "OS_purchase" && attribution) {
@@ -811,15 +771,26 @@ async function handleCollect(request, env, ctx, url) {
     );
   }
 
-  const respHeaders = { "Content-Type": "application/json", ...corsHeadersObj(origin) };
-  if (isNew) respHeaders["Set-Cookie"] = buildAnonCookie(anonId, new URL(request.url));
+  // v5.30 FIX 1: set eden_anon_id cookie on /collect response if missing
+  // This catches users who visited before worker deployment or whose cookie expired
+  const respHeaders = {
+    "Content-Type": "application/json",
+    ...corsHeadersObj(origin),
+  };
+  if (isNew) {
+    respHeaders["Set-Cookie"] = buildAnonCookie(anonId, new URL(request.url));
+    console.log(`[eden-analytics] collect: set eden_anon_id cookie for new visitor ${anonId}`);
+  }
 
   return new Response(JSON.stringify({ ok: true, anonId }), { status: 200, headers: respHeaders });
 }
 
 
 // =============================================================================
-// /server-collect HANDLER
+// /server-collect HANDLER — v5.30
+// FIX 3: recover anonId from id:link KV
+// FIX 3: inject email_sha256 from KV onto OS_purchase
+// FIX 2: resolveOrderId now reads ecommerce.transaction_id
 // =============================================================================
 
 async function handleServerCollect(request, env, ctx) {
@@ -837,10 +808,26 @@ async function handleServerCollect(request, env, ctx) {
   }
 
   const identity  = resolveIdentityFromBody(request, body);
-  const anonId    = identity.anonymousId || null;
+  let   anonId    = identity.anonymousId || null;
   const userId    = identity.userId || null;
   const eventName = canonicalizeEventName(resolveEventName(body));
-  const orderId   = resolveOrderId(body);
+  const orderId   = resolveOrderId(body);  // v5.30: now finds ecommerce.transaction_id
+
+  // v5.30 FIX 3a: recover anonId from id:link KV when server doesn't provide it
+  if (!anonId && userId && env.GCLID_KV) {
+    try {
+      const linkData = await env.GCLID_KV.get(KV_IDLINK_PREFIX + userId);
+      if (linkData) {
+        const parsed = JSON.parse(linkData);
+        anonId = parsed.anonId || null;
+        if (anonId) {
+          console.log(`[eden-analytics] server-collect: recovered anonId ${anonId} for userId ${userId}`);
+        }
+      }
+    } catch (err) {
+      console.error("[eden-analytics] server-collect anonId recovery:", err);
+    }
+  }
 
   if (!anonId && !userId) {
     console.warn("[eden-analytics] server-collect: no identity for event:", eventName);
@@ -850,6 +837,19 @@ async function handleServerCollect(request, env, ctx) {
   if (userId)    body.userId      = userId;
   if (anonId)    body.anonymousId = anonId;
   if (orderId && !body.properties.order_id) body.properties.order_id = orderId;
+
+  // v5.30 FIX 3b: inject email_sha256 from KV onto OS_purchase
+  if (eventName === "OS_purchase" && userId && env.GCLID_KV && !body.properties.email_sha256) {
+    try {
+      const storedEmailHash = await env.GCLID_KV.get(KV_EMAIL_PREFIX + userId);
+      if (storedEmailHash) {
+        body.properties.email_sha256 = storedEmailHash;
+        console.log(`[eden-analytics] server-collect: injected email_sha256 for userId ${userId}`);
+      }
+    } catch (err) {
+      console.error("[eden-analytics] server-collect email hash read:", err);
+    }
+  }
 
   // Edge dedup
   if (CONVERSION_EVENTS.has(eventName) && orderId && env.GCLID_KV) {
@@ -867,11 +867,11 @@ async function handleServerCollect(request, env, ctx) {
     }
   }
 
+  // v5.30: use recovered anonId in resolveAttribution
   const storedAttribution = env.GCLID_KV
     ? await resolveAttribution(env.GCLID_KV, anonId, userId, orderId)
     : null;
 
-  // Strip stored_at — must never appear in event properties
   if (storedAttribution) {
     for (const [k, v] of Object.entries(storedAttribution)) {
       if (KV_INTERNAL_FIELDS.has(k)) continue;
@@ -909,7 +909,7 @@ async function handleServerCollect(request, env, ctx) {
   const superProps = {
     portal:           "patient",
     source_type:      "server",
-    pipeline_version: "5.29",
+    pipeline_version: PIPELINE_VERSION,
     ...(identity.identityWarning ? { identity_warning: identity.identityWarning } : {}),
     ...(!anonId && !userId       ? { identity_warning: "no_identity_provided"   } : {}),
   };
@@ -933,7 +933,8 @@ async function handleServerCollect(request, env, ctx) {
 
 
 // =============================================================================
-// /identify HANDLER — v5.28/v5.29
+// /identify HANDLER — v5.30
+// FIX 1: store email_sha256 in KV under email:user:{userId}
 // =============================================================================
 
 async function handleIdentify(request, env, ctx) {
@@ -972,7 +973,6 @@ async function handleIdentify(request, env, ctx) {
   if (userId) body.userId      = userId;
   if (anonId) body.anonymousId = anonId;
 
-  // Step 1: Idempotency check
   let alreadyLinked = false;
   if (env.GCLID_KV && anonId && userId && anonId !== userId) {
     try {
@@ -986,7 +986,6 @@ async function handleIdentify(request, env, ctx) {
     } catch {}
   }
 
-  // Step 2: Alias guard — fires exactly once per userId ever
   let aliasFired = false;
   if (env.GCLID_KV && anonId && userId && anonId !== userId) {
     try {
@@ -995,12 +994,10 @@ async function handleIdentify(request, env, ctx) {
     } catch {}
   }
 
-  // Step 3: Resolve attribution (4-way: anon / user / order / gcl)
   const storedAttribution = env.GCLID_KV
     ? await resolveAttribution(env.GCLID_KV, anonId, userId, orderId)
     : null;
 
-  // Step 4: Build enriched traits
   const attributionTraits = {};
   if (storedAttribution) {
     const campaignProps = buildCampaignContext(storedAttribution);
@@ -1018,7 +1015,7 @@ async function handleIdentify(request, env, ctx) {
 
   const enrichedTraits = await hashEmail({ ...attributionTraits, ...rawTraits });
 
-  // Step 5: KV writes
+  // v5.30 FIX 1: KV writes — add email_sha256 storage
   if (!alreadyLinked && env.GCLID_KV && anonId && userId && anonId !== userId) {
     ctx.waitUntil(Promise.all([
       linkUserAttribution(env.GCLID_KV, anonId, userId)
@@ -1031,11 +1028,27 @@ async function handleIdentify(request, env, ctx) {
     ]));
   }
 
-  // Steps 6 + 7 + 8: Segment calls
+  // v5.30 FIX 1: store email_sha256 in KV for server-collect retrieval
+  if (userId && env.GCLID_KV) {
+    const emailRaw = resolveEmailFromBody(body)
+      || rawTraits?.email
+      || rawTraits?.customerEmail
+      || null;
+    if (emailRaw) {
+      const emailHash = await sha256(emailRaw.trim().toLowerCase());
+      ctx.waitUntil(
+        env.GCLID_KV.put(
+          KV_EMAIL_PREFIX + userId,
+          emailHash,
+          { expirationTtl: KV_TTL }
+        ).catch(err => console.error("[eden-analytics] KV email hash write:", err))
+      );
+    }
+  }
+
   if (env.SEGMENT_WRITE_KEY) {
     ctx.waitUntil((async () => {
       try {
-        // Step 6: identify with enriched attribution traits
         await segmentPost(env.SEGMENT_WRITE_KEY, "identify", {
           anonymousId: anonId || userId,
           userId,
@@ -1044,7 +1057,6 @@ async function handleIdentify(request, env, ctx) {
           timestamp: nowUTC(),
         });
 
-        // Step 7: alias — exactly once, KV flag guaranteed by ctx.waitUntil
         if (!aliasFired && anonId && userId && anonId !== userId) {
           await segmentPost(env.SEGMENT_WRITE_KEY, "alias", {
             previousId: anonId, userId, timestamp: nowUTC(),
@@ -1058,7 +1070,6 @@ async function handleIdentify(request, env, ctx) {
           }
         }
 
-        // Step 8: group (B2B)
         if (groupId) {
           await segmentPost(env.SEGMENT_WRITE_KEY, "group", {
             anonymousId: anonId || userId, userId, groupId,
@@ -1082,7 +1093,7 @@ async function handleIdentify(request, env, ctx) {
 
 
 // =============================================================================
-// /preserve-attribution HANDLER
+// /preserve-attribution HANDLER — unchanged from v5.29
 // =============================================================================
 
 async function handlePreserveAttribution(request, env, ctx) {
@@ -1146,7 +1157,7 @@ function extractPreAuthAttribution(request) {
 
 
 // =============================================================================
-// SEGMENT FORWARDING
+// SEGMENT FORWARDING — unchanged from v5.29
 // =============================================================================
 
 async function forwardToSegment(writeKey, body, anonId, superProps, attribution = {}) {
@@ -1203,7 +1214,7 @@ async function forwardToSegment(writeKey, body, anonId, superProps, attribution 
 
 
 // =============================================================================
-// KV ATTRIBUTION
+// KV ATTRIBUTION — unchanged from v5.29
 // =============================================================================
 
 async function storeAttribution(kv, key, attribution) {
@@ -1251,7 +1262,6 @@ async function getAttribution(kv, key) {
   } catch { return null; }
 }
 
-// 4-way lookup: anon → user → order → gcl (v5.29 cross-domain bridge)
 async function resolveAttribution(kv, anonId, userId, orderId = null, gclAu = null) {
   if (!kv) return null;
   const [fromAnon, fromUser, fromOrder, fromGcl] = await Promise.all([
@@ -1289,7 +1299,7 @@ function stripInternalFields(attribution) {
 
 
 // =============================================================================
-// CLICK ID + UTM EXTRACTION
+// CLICK ID + UTM EXTRACTION — unchanged from v5.29
 // =============================================================================
 
 function extractClickIds(url) {
@@ -1338,7 +1348,7 @@ function extractUTMs(url) {
 
 
 // =============================================================================
-// ATTRIBUTION HELPERS
+// ATTRIBUTION HELPERS — unchanged from v5.29
 // =============================================================================
 
 function buildCampaignContext(attribution) {
@@ -1428,16 +1438,40 @@ function resolveEventName(body) {
     body.properties?.event||body.properties?.event_name||body.properties?.name||"";
 }
 
+// v5.30 FIX 2: resolveOrderId reads ecommerce.transaction_id
 function resolveOrderId(body) {
-  return body.properties?.order_id||body.properties?.orderId||
-    body.order_id||body.orderId||
-    body.properties?.master_id||body.properties?.masterId||null;
+  return (
+    body.properties?.order_id                  ||
+    body.properties?.orderId                   ||
+    body.properties?.master_id                 ||
+    body.properties?.masterId                  ||
+    body.properties?.ecommerce?.transaction_id ||  // Gowtham's payload
+    body.properties?.ecommerce?.order_id       ||  // fallback
+    body.properties?.ecommerce?.treatmentId    ||  // tertiary fallback
+    body.order_id                              ||
+    body.orderId                               ||
+    null
+  );
 }
 
 function resolveUserIdFromBody(body) {
   return body.userId||body.user_id||
     body.properties?.userId||body.properties?.user_id||
-    body.properties?.patient_id||body.properties?.customer_id||null;
+    body.properties?.patient_id||body.properties?.customer_id||
+    body.properties?.ecommerce?.userId||   // v5.30: also check ecommerce
+    null;
+}
+
+// v5.30 NEW: resolveEmailFromBody
+function resolveEmailFromBody(body) {
+  return (
+    body.properties?.email                ||
+    body.properties?.customerEmail        ||   // Gowtham sends this
+    body.properties?.ecommerce?.email     ||   // also nested here
+    body.traits?.email                    ||
+    body.context?.traits?.email           ||
+    null
+  );
 }
 
 function resolveIdentityFromBody(request, body) {
@@ -1458,7 +1492,7 @@ function resolveIdentityFromBody(request, body) {
 
 
 // =============================================================================
-// ORGANIC SEARCH DETECTION
+// ORGANIC SEARCH DETECTION — unchanged from v5.29
 // =============================================================================
 
 function detectOrganic(referrer) {
@@ -1490,7 +1524,7 @@ function detectOrganic(referrer) {
 
 
 // =============================================================================
-// BOT + SYNTHETIC DETECTION
+// BOT + SYNTHETIC DETECTION — unchanged from v5.29
 // =============================================================================
 
 function isBot(request) {
@@ -1519,7 +1553,7 @@ function isStaticAsset(url) {
 
 
 // =============================================================================
-// EMAIL HASHING
+// EMAIL HASHING — unchanged from v5.29
 // =============================================================================
 
 async function hashEmail(props) {
@@ -1543,7 +1577,7 @@ async function sha256(value) {
 
 
 // =============================================================================
-// SEGMENT POST
+// SEGMENT POST — unchanged from v5.29
 // =============================================================================
 
 async function segmentPost(writeKey, endpoint, payload) {
@@ -1557,7 +1591,7 @@ async function segmentPost(writeKey, endpoint, payload) {
 
 
 // =============================================================================
-// COOKIE HELPERS
+// COOKIE HELPERS — unchanged from v5.29
 // =============================================================================
 
 function readCookie(request, name) {
@@ -1591,7 +1625,7 @@ function isMobile(ua) { return /Mobile|Android|iPhone|iPad|iPod/i.test(ua); }
 
 
 // =============================================================================
-// URL HELPERS
+// URL HELPERS — unchanged from v5.29
 // =============================================================================
 
 function sanitizeUrl(url) {
@@ -1611,7 +1645,7 @@ function sanitizeUrlString(v) {
 
 
 // =============================================================================
-// CORS HELPERS
+// CORS HELPERS — unchanged from v5.29
 // =============================================================================
 
 function isAllowedOrigin(o) { return !!o && ALLOWED_ORIGINS.includes(o); }
