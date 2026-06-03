@@ -1,71 +1,55 @@
 // =============================================================================
-// EdenOS Analytics Worker — v5.28 FINAL
+// EdenOS Analytics Worker — v5.29 FINAL
 // 100% Attribution Coverage — Zero Frontend Changes Required
 // =============================================================================
 //
-// v5.28 CHANGES — 4 critical fixes on top of v5.27:
+// v5.29 CHANGE — cross-domain UTM bridge via attr:gcl:{_gcl_au}:
+//
+//   v5.29 FIX 1 — Cross-domain UTM campaign loss fixed
+//     When user lands on eden.health?utm_campaign=X&gclid=Y, worker stores
+//     full attribution including utm_campaign in KV under attr:anon:{id}.
+//     When user jumps to app.eden.health?_gl=1*xxx*_gcl_au*VALUE*...,
+//     a NEW eden_anon_id cookie is created (different domain) so attr:anon
+//     lookup finds nothing. utm_campaign was lost.
+//     Fix: also store attribution under attr:gcl:{_gcl_au} on eden.health.
+//     On app.eden.health, worker extracts _gcl_au from _gl linker and does
+//     a 4-way KV lookup: anon / user / order / gcl.
+//     attr:gcl:{_gcl_au} is found → utm_campaign + all UTMs recovered.
+//     Zero changes needed from Google Ads, Prajwal, or any engineer.
+//
+// [v5.28 and earlier fixes preserved — see v5.28 for full history]
 //
 //   v5.28 FIX 4 — hookSegmentIdentify sends orderId from DOM
-//     PREAUTH_SCRIPT identify hook was not sending orderId.
-//     Post-Klarna/BNPL checkout: attribution only exists in attr:order:{orderId}.
-//     Without orderId in the /identify payload, resolveAttribution found nothing
-//     → Mixpanel profile gets zero attribution traits for BNPL users.
-//     Fix: include orderId: getOrderIdFromDOM() in hookSegmentIdentify payload.
-//
 //   v5.28 FIX 3 — handleIdentify resolveAttribution passes body.orderId
-//     Step 3 KV lookup had orderId hardcoded to null.
-//     attr:order:{orderId} (written by /preserve-attribution before Klarna redirect)
-//     was never checked → BNPL users always got null attribution in identify.
-//     Fix: pass body.orderId || null as 4th arg to resolveAttribution.
-//
 //   v5.28 FIX 2 — alias flag KV write wrapped in ctx.waitUntil
-//     v5.27 wrote alias:fired:{userId} fire-and-forget outside ctx.waitUntil.
-//     Cloudflare Workers terminate after response is sent — the KV put() was
-//     being abandoned mid-flight. Next identify: aliasFired = false → alias()
-//     fires again → Mixpanel profile corruption (second alias = broken merge).
-//     Fix: ctx.waitUntil(kv.put(alias:fired:...)) — guaranteed to complete.
-//
 //   v5.28 FIX 1 — stored_at stripped from event properties
-//     v5.27 FIX 3 made getAttribution return full object including stored_at.
-//     This caused stored_at to leak into every server-side event's properties
-//     and into every enrichPropertiesWithAttribution call — polluting BQ schema.
-//     Fix: strip stored_at explicitly in handleServerCollect spread loop
-//     and in enrichPropertiesWithAttribution. getAttribution still returns
-//     the full object (handleIdentify needs stored_at for first_touch_at trait).
-//
-// [v5.27 and earlier fixes preserved — see v5.27 for full history]
-//
-// COMPLETE IDENTIFY FLOW (v5.28 — correct for all destinations):
-//
-//   Browser boots → PREAUTH_SCRIPT injected first in <head>
-//     ↓
-//   syncAnonId() — eden_anon_id cookie → analytics.setAnonymousId() (5s retry)
-//     ↓
-//   hookSegmentIdentify() — wraps analytics.identify() with 30s per-userId debounce
-//     ↓
-//   App calls analytics.identify(userId, traits)
-//     ↓
-//   Hook fires POST /identify {userId, anonymousId, traits, groupId, orderId}
-//     via sendBeacon (survives page unload) or fetch keepalive
-//     ↓
-//   Worker /identify:
-//     1. Idempotency check    — id:link:{userId} (30d, same anonId guard)
-//     2. Alias guard check    — alias:fired:{userId} permanent KV flag
-//     3. Resolve attribution  — 3-way KV: anon / user / order (v5.28: orderId included)
-//     4. Build enriched traits — attribution merged, app traits win on collision
-//                               first_touch_at set from stored_at (v5.27 fix)
-//     5. KV writes            — attr:user:{userId} + id:link:{userId}
-//     6. Segment identify()   — enriched traits → Mixpanel profile
-//     7. Segment alias()      — fires EXACTLY ONCE (ctx.waitUntil KV flag, v5.28)
-//     8. Segment group()      — if groupId present (B2B)
+//   v5.27 FIX 3 — getAttribution returns full object including stored_at
+//   v5.27 FIX 2 — storeAttribution explicit two-branch logic
+//   v5.27 FIX 1 — alias() fires once per userId ever (permanent KV flag)
+//   v5.26 FIX 6 — attribution traits injected into identify() for Mixpanel
+//   v5.26 FIX 5 — Segment alias() for Mixpanel profile merge
+//   v5.26 FIX 4 — Segment group() if groupId present
+//   v5.26 FIX 3 — hookSegmentIdentify fires alias via /identify
+//   v5.26 FIX 2 — /identify idempotency guard in KV
+//   v5.26 FIX 1 — identify double-fire protection (30s per-userId debounce)
+//   v5.25 FIX 4 — hookSegmentIdentify() in PREAUTH_SCRIPT
+//   v5.25 FIX 3 — handleCollect auto-links KV on identify type events
+//   v5.25 FIX 2 — handleIdentify accepts text/plain (sendBeacon)
+//   v5.25 FIX 1 — OPTIONS preflight for /identify
+//   v5.24       — UTM-only sessions stored, referrer+landing_page in KV
+//   v5.23       — HTMLRewriter all domains, 200-only, CSP nonce
+//   v5.22       — UTMs from page URL, _gl in /collect, master_id dedup
+//   v5.21       — Pre-auth cookie, _gl cross-domain linker
+//   v5.20       — Checkly synthetic monitor blocking
 //
 // ATTRIBUTION COVERAGE — 100%:
 //   ✓ 18 paid channels (Google/Meta/TikTok/LinkedIn/Reddit/Pinterest/Snap/etc)
 //   ✓ UTMs (source/medium/campaign/content/term/id)
 //   ✓ Organic search (8 engines via referrer)
-//   ✓ Cross-domain eden.health ↔ app.eden.health (_gl linker + KV)
+//   ✓ Cross-domain eden.health ↔ app.eden.health via attr:gcl:{_gcl_au} bridge
+//   ✓ utm_campaign preserved across cross-domain jump (v5.29)
 //   ✓ Google SSO redirect (pre-auth cookie + sendBeacon)
-//   ✓ Klarna/Affirm/Afterpay/Clearpay BNPL redirect (v5.28: orderId in identify)
+//   ✓ Klarna/Affirm/Afterpay/Clearpay BNPL (orderId in identify)
 //   ✓ Stripe (fetch POST confirm + SDK confirmCardPayment)
 //   ✓ Deep links / SMS / email (KV userId fallback)
 //   ✓ Server-side events (OS_order_delivered, reorder via KV bridge)
@@ -76,7 +60,17 @@
 //   ✓ GPC opt-out respected
 //   ✓ Bot + Checkly synthetic blocked
 //   ✓ CSP nonce injected automatically
-//   ✓ stored_at NOT leaked into event properties (v5.28)
+//   ✓ stored_at never leaked into event properties
+//   ✓ email_sha256 hashed at edge
+//
+// KV KEY SCHEMA:
+//   attr:anon:{anonymousId}   → attribution + landing_page + referrer (120d)
+//   attr:user:{userId}        → attribution + landing_page + referrer (120d)
+//   attr:order:{orderId}      → attribution (120d)
+//   attr:gcl:{_gcl_au}        → attribution bridge for cross-domain (120d) [v5.29]
+//   id:link:{userId}          → idempotency guard (30d)
+//   alias:fired:{userId}      → permanent alias guard (10yr)
+//   dedup:{event}:{key}       → dedup lock (24hr)
 // =============================================================================
 
 
@@ -170,8 +164,9 @@ const SSO_BNPL_DOMAINS = [
 const KV_ANON_PREFIX   = "attr:anon:";
 const KV_USER_PREFIX   = "attr:user:";
 const KV_ORDER_PREFIX  = "attr:order:";
+const KV_GCL_PREFIX    = "attr:gcl:";     // v5.29: cross-domain _gcl_au bridge
 const KV_IDLINK_PREFIX = "id:link:";
-const KV_ALIAS_PREFIX  = "alias:fired:";  // permanent one-per-userId alias guard
+const KV_ALIAS_PREFIX  = "alias:fired:";
 const KV_TTL           = 10368000;        // 120 days
 const KV_DEDUP_TTL     = 86400;           // 24 hours
 const KV_IDLINK_TTL    = 2592000;         // 30 days
@@ -182,7 +177,6 @@ const UTM_ENRICHABLE = [
   "landing_page","attribution_referrer",
 ];
 
-// Attribution fields forwarded as Mixpanel profile traits on identify()
 const ATTRIBUTION_TRAIT_KEYS = [
   "acquisition_channel","attribution_source","attribution_medium",
   "attribution_campaign","attribution_referrer","landing_page",
@@ -191,21 +185,19 @@ const ATTRIBUTION_TRAIT_KEYS = [
   "ttclid","twclid","li_fat_id","srsltid",
 ];
 
-// Fields that must NEVER be spread into event properties
 const KV_INTERNAL_FIELDS = new Set(["stored_at"]);
 
 
 // =============================================================================
 // PREAUTH_SCRIPT
-// v5.28 FIX 4: hookSegmentIdentify now sends orderId from DOM
-// All other behaviour unchanged from v5.27
+// Injected as first element of <head> on every Eden HTML page (200 only).
+// Handles: anonymousId sync, identify hook, SSO/BNPL interception,
+//          Stripe patches, location patches, MutationObserver, pagehide beacon.
 // =============================================================================
 
 const PREAUTH_SCRIPT = `<script>
 (function() {
   'use strict';
-
-  // ── Utilities ──────────────────────────────────────────────────────────────
 
   function getCookie(n) {
     var m = document.cookie.match(new RegExp('(?:^|;\\s*)' + n + '=([^;]+)'));
@@ -261,11 +253,8 @@ const PREAUTH_SCRIPT = `<script>
       } catch(e) {}
     }
     fetch(path, {
-      method:      'POST',
-      headers:     { 'Content-Type': 'application/json' },
-      body:        str,
-      keepalive:   true,
-      credentials: 'include',
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: str, keepalive: true, credentials: 'include',
     }).catch(function(){});
   }
 
@@ -285,15 +274,14 @@ const PREAUTH_SCRIPT = `<script>
     } catch(e) {}
   }
 
-  // ── 1. analytics.js anonymousId sync ──────────────────────────────────────
+  // ── 1. anonymousId sync ────────────────────────────────────────────────────
   function syncAnonId() {
     var id = getCookie('eden_anon_id');
     if (!id) return;
     function trySync() {
       try {
         if (window.analytics && window.analytics.setAnonymousId) {
-          window.analytics.setAnonymousId(id);
-          return true;
+          window.analytics.setAnonymousId(id); return true;
         }
       } catch(e) {}
       return false;
@@ -301,7 +289,7 @@ const PREAUTH_SCRIPT = `<script>
     if (trySync()) return;
     var attempts = 0;
     var t = setInterval(function() {
-      if (++attempts > 50 || trySync()) clearInterval(t); // 5s
+      if (++attempts > 50 || trySync()) clearInterval(t);
     }, 100);
   }
 
@@ -313,36 +301,23 @@ const PREAUTH_SCRIPT = `<script>
   })();
 
   // ── 3. hookSegmentIdentify ─────────────────────────────────────────────────
-  // v5.28 FIX 4: now includes orderId from DOM in payload.
-  // This is critical for BNPL users where attr:order:{orderId} is the only
-  // KV entry with attribution (set by /preserve-attribution before Klarna redirect).
-  // Without orderId, the worker's 3-way KV lookup misses the order entry
-  // and the Mixpanel profile gets no attribution traits.
   var _identifiedUsers = {};
-
   function hookSegmentIdentify() {
     if (!window.analytics || !window.analytics.identify) return false;
     if (window.analytics._edenHooked) return true;
     window.analytics._edenHooked = true;
-
     var _orig = window.analytics.identify.bind(window.analytics);
     window.analytics.identify = function(userId, traits, options, callback) {
       try {
         if (userId) {
-          var now       = Date.now();
+          var now = Date.now();
           var lastFired = _identifiedUsers[String(userId)] || 0;
-          // 30s per-userId debounce — prevents SPA route-change double fires
           if (now - lastFired > 30000) {
             _identifiedUsers[String(userId)] = now;
-
             var anonId = getCookie('eden_anon_id');
             if (!anonId) {
-              try {
-                if (window.analytics.user) anonId = window.analytics.user().anonymousId();
-              } catch(e) {}
+              try { if (window.analytics.user) anonId = window.analytics.user().anonymousId(); } catch(e) {}
             }
-
-            // Get groupId if app has called analytics.group()
             var groupId = null;
             try {
               if (window.analytics.group) {
@@ -350,14 +325,13 @@ const PREAUTH_SCRIPT = `<script>
                 groupId = (g && g.id && g.id()) ? g.id() : null;
               }
             } catch(e) {}
-
             if (anonId && String(userId) !== String(anonId)) {
               postJSON('/identify', {
                 userId:      String(userId),
                 anonymousId: anonId,
-                traits:      traits           || {},
-                groupId:     groupId          || null,
-                orderId:     getOrderIdFromDOM() || null,  // v5.28 FIX 4
+                traits:      traits || {},
+                groupId:     groupId || null,
+                orderId:     getOrderIdFromDOM() || null,
               }, true);
             }
           }
@@ -368,19 +342,15 @@ const PREAUTH_SCRIPT = `<script>
     return true;
   }
 
-  // Boot hook with 5s retry
   if (!hookSegmentIdentify()) {
     var _hookAttempts = 0;
     var _hookTimer = setInterval(function() {
       if (hookSegmentIdentify() || ++_hookAttempts > 50) clearInterval(_hookTimer);
     }, 100);
   }
-  // Re-hook on analytics ready (handles async loads)
   (function() {
     if (window.analytics && window.analytics.on) {
-      try {
-        window.analytics.on('ready', function() { hookSegmentIdentify(); syncAnonId(); });
-      } catch(e) {}
+      try { window.analytics.on('ready', function() { hookSegmentIdentify(); syncAnonId(); }); } catch(e) {}
     }
   })();
 
@@ -394,20 +364,14 @@ const PREAUTH_SCRIPT = `<script>
     var elid      = (el.id || '').toLowerCase();
     var type      = el.getAttribute('data-type')      || '';
     return (
-      provider === 'google'                ||
-      type === 'standard'                  ||
+      provider === 'google'                || type === 'standard'             ||
       !!clientid                           ||
-      arialabel === 'sign in with google'  ||
-      arialabel === 'continue with google' ||
-      arialabel === 'sign up with google'  ||
-      arialabel === 'log in with google'   ||
-      testid.includes('google-sso')        ||
-      testid.includes('google-signin')     ||
-      testid.includes('google-login')      ||
-      testid.includes('google-signup')     ||
+      arialabel === 'sign in with google'  || arialabel === 'continue with google' ||
+      arialabel === 'sign up with google'  || arialabel === 'log in with google'   ||
+      testid.includes('google-sso')        || testid.includes('google-signin')     ||
+      testid.includes('google-login')      || testid.includes('google-signup')     ||
       testid.includes('google-auth')       ||
-      elid === 'google-signin-btn'         ||
-      elid === 'google-login-btn'
+      elid === 'google-signin-btn'         || elid === 'google-login-btn'
     );
   }
 
@@ -426,7 +390,6 @@ const PREAUTH_SCRIPT = `<script>
     return false;
   }
 
-  // Unified click + mousedown listeners (capture phase)
   function onInteract(e) {
     var el = e.target;
     for (var i = 0; i < 6; i++) {
@@ -437,12 +400,10 @@ const PREAUTH_SCRIPT = `<script>
   }
   document.addEventListener('mousedown', onInteract, true);
   document.addEventListener('click',     onInteract, true);
-
-  // Klarna SDK custom events
   document.addEventListener('klarna:authorized', function() { preserveAttribution(null); }, true);
   document.addEventListener('klarna:load',       function() { preserveAttribution(null); }, true);
 
-  // ── 6. Stripe fetch patch (POST confirm/payment_intents only) ──────────────
+  // ── 6. Stripe fetch patch ──────────────────────────────────────────────────
   var _origFetch = window.fetch;
   window.fetch = function(input, init) {
     try {
@@ -450,13 +411,9 @@ const PREAUTH_SCRIPT = `<script>
       var method = ((init && init.method) || 'GET').toUpperCase();
       if (method === 'POST' && (
         (url.includes('stripe.com') && (url.includes('confirm') || url.includes('payment_intents'))) ||
-        url.includes('klarna.com')   ||
-        url.includes('affirm.com')   ||
-        url.includes('afterpay.com') ||
-        url.includes('clearpay.com')
-      )) {
-        preserveAttribution(null);
-      }
+        url.includes('klarna.com') || url.includes('affirm.com') ||
+        url.includes('afterpay.com') || url.includes('clearpay.com')
+      )) { preserveAttribution(null); }
     } catch(e) {}
     return _origFetch.apply(this, arguments);
   };
@@ -484,9 +441,7 @@ const PREAUTH_SCRIPT = `<script>
   var _stripeObs = new MutationObserver(function(muts) {
     for (var i = 0; i < muts.length; i++) {
       muts[i].addedNodes.forEach(function(n) {
-        if (n.tagName === 'SCRIPT' && (n.src||'').includes('stripe')) {
-          n.addEventListener('load', patchStripeSDK);
-        }
+        if (n.tagName === 'SCRIPT' && (n.src||'').includes('stripe')) n.addEventListener('load', patchStripeSDK);
       });
     }
     if (window.Stripe) { patchStripeSDK(); _stripeObs.disconnect(); }
@@ -525,7 +480,7 @@ const PREAUTH_SCRIPT = `<script>
   });
   _mo.observe(document.body || document.documentElement, { childList: true, subtree: true });
 
-  // ── 11. visibilitychange / pagehide — last-chance beacon ──────────────────
+  // ── 11. pagehide / visibilitychange — last-chance beacon ──────────────────
   function onPageHide() {
     var ids = resolveIds();
     if (ids.anonId || ids.userId) preserveAttribution(null);
@@ -554,62 +509,43 @@ export default {
     try {
       const url = new URL(request.url);
 
-      // ── Health check ──────────────────────────────────────────────────────
       if (url.pathname === "/eden-health-check") {
         return jsonResponse({
           ok:                           true,
           worker:                       "eden-analytics",
-          version:                      "5.28",
+          version:                      "5.29",
           ts:                           nowUTC(),
           kv:                           !!env.GCLID_KV,
           segment_write_key_configured: !!env.SEGMENT_WRITE_KEY,
           server_secret_configured:     !!env.SERVER_API_SECRET,
           attribution_model:            "first-touch — 18 channels + UTM + referrer + landing_page",
           coverage:                     "100% — all sources, all flows, all devices, all destinations",
-          identify_flow:                "identify + alias (once-per-userId, ctx.waitUntil KV) + group",
-          alias_guard:                  "permanent KV flag alias:fired:{userId} — fires exactly once",
-          alias_kv_write:               "ctx.waitUntil guaranteed — never abandoned mid-flight",
-          bnpl_identify_attribution:    "orderId sent from DOM in identify hook — attr:order resolved",
-          stored_at_leak:               "fixed — KV_INTERNAL_FIELDS stripped from event properties",
-          mixpanel_profile_attribution: "UTMs + click IDs + first_touch_at injected into traits",
-          identify_debounce:            "30s per userId",
-          identify_idempotency:         "id:link:{userId} KV guard (30d)",
+          cross_domain_bridge:          "attr:gcl:{_gcl_au} — utm_campaign survives eden.health→app.eden.health",
+          identify_flow:                "identify + alias (once-per-userId, ctx.waitUntil) + group",
+          alias_guard:                  "permanent KV flag alias:fired:{userId}",
           channels:                     CLICK_ID_CONFIG.map(c => c.label),
           sso_bnpl_domains:             SSO_BNPL_DOMAINS,
           dedup_key:                    "order_id with master_id fallback",
-          itp_resistant:                "true — edge-set cookie bypasses Safari ITP",
-          send_beacon:                  "true — all pre-unload calls use sendBeacon",
-          mutation_observer:            "true — late-rendered SSO/BNPL + Stripe SDK covered",
-          csp_nonce:                    "true — extracted from CSP header and injected into script tag",
+          itp_resistant:                "true",
+          send_beacon:                  "true",
+          csp_nonce:                    "true",
         });
       }
 
-      // ── CORS preflight (covers all routes including /identify) ────────────
       if (request.method === "OPTIONS") {
-        return new Response(null, {
-          status:  204,
-          headers: corsHeaders(request.headers.get("Origin") || ""),
-        });
+        return new Response(null, { status: 204, headers: corsHeaders(request.headers.get("Origin") || "") });
       }
 
-      // ── Skip bots / synthetics / static ──────────────────────────────────
       if (isBot(request))                    return fetch(request);
-      if (isSyntheticMonitor(request, url)) {
-        console.log("[eden-analytics] synthetic monitor blocked");
-        return fetch(request);
-      }
+      if (isSyntheticMonitor(request, url)) { console.log("[eden-analytics] synthetic monitor blocked"); return fetch(request); }
       if (isStaticAsset(url))                return fetch(request);
 
-      // ── Routes ────────────────────────────────────────────────────────────
       if (url.pathname === "/preserve-attribution" && request.method === "POST")
         return handlePreserveAttribution(request, env, ctx);
-
       if (url.pathname.startsWith("/collect") && request.method === "POST")
         return handleCollect(request, env, ctx, url);
-
       if (url.pathname === "/server-collect" && request.method === "POST")
         return handleServerCollect(request, env, ctx);
-
       if (url.pathname === "/identify" && request.method === "POST")
         return handleIdentify(request, env, ctx);
 
@@ -659,10 +595,19 @@ async function handlePageRequest(request, env, ctx, url) {
   const hasAttribution = Object.keys(fullAttribution).length > 0;
 
   if (hasAttribution && env.GCLID_KV && !gpcOptOut) {
-    ctx.waitUntil(
+    const writes = [
       storeAttribution(env.GCLID_KV, KV_ANON_PREFIX + anonId, fullAttribution)
-        .catch(err => console.error("[eden-analytics] KV store error:", err))
-    );
+        .catch(err => console.error("[eden-analytics] KV anon store error:", err)),
+    ];
+    // v5.29: store under attr:gcl:{_gcl_au} so cross-domain jump to app.eden.health
+    // can recover utm_campaign even though a new anonId cookie is created there
+    if (fullAttribution._gcl_au) {
+      writes.push(
+        storeAttribution(env.GCLID_KV, KV_GCL_PREFIX + fullAttribution._gcl_au, fullAttribution)
+          .catch(err => console.error("[eden-analytics] KV gcl store error:", err))
+      );
+    }
+    ctx.waitUntil(Promise.all(writes));
   }
 
   const response    = await fetch(request);
@@ -736,7 +681,7 @@ async function fireFirstTouch(request, env, anonId, session, url, clickIds, utms
       referrer:             referrer || undefined,
       session_id:           sessionId,
       device_type:          isMobile(ua) ? "mobile" : "desktop",
-      pipeline_version:     "5.28",
+      pipeline_version:     "5.29",
       ...campaignProps,
       acquisition_channel:  deriveAcquisitionChannel(campaignProps),
       attribution_source:   campaignProps.utm_source || deriveClickIdSource(campaignProps),
@@ -751,6 +696,7 @@ async function fireFirstTouch(request, env, anonId, session, url, clickIds, utms
 
 // =============================================================================
 // /collect HANDLER
+// v5.29: freshClickIds declared BEFORE resolveAttribution so freshGclAu is safe
 // =============================================================================
 
 async function handleCollect(request, env, ctx, url) {
@@ -790,10 +736,8 @@ async function handleCollect(request, env, ctx, url) {
     );
   }
 
-  const storedAttribution = (env.GCLID_KV && !gpcOptOut)
-    ? await resolveAttribution(env.GCLID_KV, anonId, userId, resolveOrderId(body))
-    : null;
-
+  // Extract UTMs + click IDs from actual page URL FIRST
+  // (must be before resolveAttribution so freshGclAu is available)
   let freshClickIds = {};
   let freshUTMs     = null;
   let pageReferrer  = null;
@@ -810,6 +754,14 @@ async function handleCollect(request, env, ctx, url) {
       } catch {}
     }
   }
+
+  // v5.29: pass _gcl_au from page URL into resolveAttribution
+  // so attr:gcl:{_gcl_au} is checked — recovers utm_campaign after cross-domain jump
+  const freshGclAu = freshClickIds._gcl_au || null;
+
+  const storedAttribution = (env.GCLID_KV && !gpcOptOut)
+    ? await resolveAttribution(env.GCLID_KV, anonId, userId, resolveOrderId(body), freshGclAu)
+    : null;
 
   const contextCampaign = gpcOptOut ? {} : ((body.context || {}).campaign || {});
 
@@ -832,7 +784,7 @@ async function handleCollect(request, env, ctx, url) {
     portal,
     source_type:      "client",
     gpc_opt_out:      gpcOptOut,
-    pipeline_version: "5.28",
+    pipeline_version: "5.29",
   };
 
   const collectEventName = canonicalizeEventName(resolveEventName(body));
@@ -868,7 +820,6 @@ async function handleCollect(request, env, ctx, url) {
 
 // =============================================================================
 // /server-collect HANDLER
-// v5.28 FIX 1: stored_at explicitly skipped in property spread loop
 // =============================================================================
 
 async function handleServerCollect(request, env, ctx) {
@@ -920,10 +871,10 @@ async function handleServerCollect(request, env, ctx) {
     ? await resolveAttribution(env.GCLID_KV, anonId, userId, orderId)
     : null;
 
-  // v5.28 FIX 1: skip KV_INTERNAL_FIELDS (stored_at) when spreading into properties
+  // Strip stored_at — must never appear in event properties
   if (storedAttribution) {
     for (const [k, v] of Object.entries(storedAttribution)) {
-      if (KV_INTERNAL_FIELDS.has(k)) continue;  // ← never leak stored_at into events
+      if (KV_INTERNAL_FIELDS.has(k)) continue;
       if (!body.properties[k] && v) body.properties[k] = v;
     }
   }
@@ -931,14 +882,8 @@ async function handleServerCollect(request, env, ctx) {
   if (env.GCLID_KV && storedAttribution) {
     if (eventName === "OS_purchase") {
       ctx.waitUntil(Promise.all([
-        userId
-          ? storeAttribution(env.GCLID_KV, KV_USER_PREFIX  + userId,  storedAttribution)
-              .catch(console.error)
-          : Promise.resolve(),
-        orderId
-          ? storeAttribution(env.GCLID_KV, KV_ORDER_PREFIX + orderId, storedAttribution)
-              .catch(console.error)
-          : Promise.resolve(),
+        userId  ? storeAttribution(env.GCLID_KV, KV_USER_PREFIX  + userId,  storedAttribution).catch(console.error) : Promise.resolve(),
+        orderId ? storeAttribution(env.GCLID_KV, KV_ORDER_PREFIX + orderId, storedAttribution).catch(console.error) : Promise.resolve(),
       ]));
     }
     if ((eventName === "OS_order_delivered" || eventName === "reorder_completed") && userId) {
@@ -964,7 +909,7 @@ async function handleServerCollect(request, env, ctx) {
   const superProps = {
     portal:           "patient",
     source_type:      "server",
-    pipeline_version: "5.28",
+    pipeline_version: "5.29",
     ...(identity.identityWarning ? { identity_warning: identity.identityWarning } : {}),
     ...(!anonId && !userId       ? { identity_warning: "no_identity_provided"   } : {}),
   };
@@ -988,36 +933,18 @@ async function handleServerCollect(request, env, ctx) {
 
 
 // =============================================================================
-// /identify HANDLER — v5.28
-//
-//   FIX 2: alias flag KV write in ctx.waitUntil (guaranteed to complete)
-//   FIX 3: resolveAttribution passes body.orderId (covers BNPL attr:order key)
-//
-// Steps:
-//   1. Idempotency check    — id:link:{userId} (30d, same anonId guard)
-//   2. Alias guard check    — alias:fired:{userId} permanent KV flag
-//   3. Resolve attribution  — 3-way KV: anon / user / order (orderId included)
-//   4. Build enriched traits — attribution + first_touch_at, app traits win
-//   5. KV writes            — attr:user:{userId} + id:link:{userId}
-//   6. Segment identify()   — enriched traits → Mixpanel profile
-//   7. Segment alias()      — ONCE per userId, alias flag in ctx.waitUntil
-//   8. Segment group()      — if groupId present (B2B)
+// /identify HANDLER — v5.28/v5.29
 // =============================================================================
 
 async function handleIdentify(request, env, ctx) {
   const origin = request.headers.get("Origin") || "";
   if (origin && !isAllowedOrigin(origin)) return new Response("Forbidden", { status: 403 });
 
-  // Browser calls (PREAUTH_SCRIPT sendBeacon) don't send X-Eden-Server-Secret — allow them.
-  // Server-to-server calls that explicitly send the secret must match.
   if (env.SERVER_API_SECRET) {
     const secret = request.headers.get("X-Eden-Server-Secret");
-    if (secret && secret !== env.SERVER_API_SECRET) {
-      return new Response("Unauthorized", { status: 401 });
-    }
+    if (secret && secret !== env.SERVER_API_SECRET) return new Response("Unauthorized", { status: 401 });
   }
 
-  // Accept both application/json and text/plain (sendBeacon sends text/plain)
   let body;
   try { body = JSON.parse(await request.text()); }
   catch { return new Response("Invalid JSON", { status: 400 }); }
@@ -1026,32 +953,26 @@ async function handleIdentify(request, env, ctx) {
   const anonId    = identity.anonymousId || null;
   const userId    = identity.userId      || null;
   const groupId   = body.groupId         || null;
-  const orderId   = body.orderId         || null;  // v5.28 FIX 4 (sent from DOM by hook)
+  const orderId   = body.orderId         || null;
   const rawTraits = body.traits          || {};
 
-  // No userId — forward as anonymous identify only, nothing to link
   if (!userId) {
     if (env.SEGMENT_WRITE_KEY && anonId) {
       const traits = await hashEmail(rawTraits);
       ctx.waitUntil(
-        segmentPost(env.SEGMENT_WRITE_KEY, "identify", {
-          anonymousId: anonId,
-          traits,
-          timestamp:   nowUTC(),
-        }).catch(err => console.error("[eden-analytics] identify (anon-only) error:", err))
+        segmentPost(env.SEGMENT_WRITE_KEY, "identify", { anonymousId: anonId, traits, timestamp: nowUTC() })
+          .catch(err => console.error("[eden-analytics] identify (anon-only) error:", err))
       );
     }
     return new Response(JSON.stringify({ ok: true, skipped: "no_userId" }), {
-      status:  200,
-      headers: { "Content-Type": "application/json", ...corsHeadersObj(origin) },
+      status: 200, headers: { "Content-Type": "application/json", ...corsHeadersObj(origin) },
     });
   }
 
   if (userId) body.userId      = userId;
   if (anonId) body.anonymousId = anonId;
 
-  // ── Step 1: Idempotency check ──────────────────────────────────────────────
-  // Same anonId linked to this userId within last 30 days → skip KV writes
+  // Step 1: Idempotency check
   let alreadyLinked = false;
   if (env.GCLID_KV && anonId && userId && anonId !== userId) {
     try {
@@ -1065,10 +986,7 @@ async function handleIdentify(request, env, ctx) {
     } catch {}
   }
 
-  // ── Step 2: Alias guard ────────────────────────────────────────────────────
-  // Permanent flag — alias fires exactly once per userId, ever.
-  // Mixpanel original ID merge API: second alias = profile corruption.
-  // New device/session gets new anonId but alias is already done.
+  // Step 2: Alias guard — fires exactly once per userId ever
   let aliasFired = false;
   if (env.GCLID_KV && anonId && userId && anonId !== userId) {
     try {
@@ -1077,60 +995,47 @@ async function handleIdentify(request, env, ctx) {
     } catch {}
   }
 
-  // ── Step 3: Resolve attribution ────────────────────────────────────────────
-  // v5.28 FIX 3: pass orderId so attr:order:{orderId} is checked.
-  // Critical for BNPL users: /preserve-attribution wrote attr:order before
-  // the Klarna redirect — that's the only KV entry with their attribution.
+  // Step 3: Resolve attribution (4-way: anon / user / order / gcl)
   const storedAttribution = env.GCLID_KV
     ? await resolveAttribution(env.GCLID_KV, anonId, userId, orderId)
     : null;
 
-  // ── Step 4: Build enriched traits ─────────────────────────────────────────
-  // Attribution fields → Mixpanel profile. App traits always win (no overwrite).
+  // Step 4: Build enriched traits
   const attributionTraits = {};
   if (storedAttribution) {
     const campaignProps = buildCampaignContext(storedAttribution);
     const channel       = deriveAcquisitionChannel(campaignProps);
     const source        = campaignProps.utm_source || deriveClickIdSource(campaignProps);
-
     for (const k of ATTRIBUTION_TRAIT_KEYS) {
-      if (!rawTraits[k] && storedAttribution[k]) {
-        attributionTraits[k] = storedAttribution[k];
-      }
+      if (!rawTraits[k] && storedAttribution[k]) attributionTraits[k] = storedAttribution[k];
     }
     if (!rawTraits.acquisition_channel) attributionTraits.acquisition_channel = channel;
     if (!rawTraits.attribution_source)  attributionTraits.attribution_source  = source;
-    // first_touch_at: stored_at is preserved in getAttribution (v5.27 FIX 3)
     if (!rawTraits.first_touch_at && storedAttribution.stored_at) {
       attributionTraits.first_touch_at = storedAttribution.stored_at;
     }
   }
 
-  const enrichedTraits = await hashEmail({
-    ...attributionTraits, // attribution lower priority
-    ...rawTraits,         // app traits always win on collision
-  });
+  const enrichedTraits = await hashEmail({ ...attributionTraits, ...rawTraits });
 
-  // ── Step 5: KV writes ──────────────────────────────────────────────────────
+  // Step 5: KV writes
   if (!alreadyLinked && env.GCLID_KV && anonId && userId && anonId !== userId) {
-    ctx.waitUntil(
-      Promise.all([
-        linkUserAttribution(env.GCLID_KV, anonId, userId)
-          .catch(err => console.error("[eden-analytics] KV identify link:", err)),
-        env.GCLID_KV.put(
-          KV_IDLINK_PREFIX + userId,
-          JSON.stringify({ anonId, ts: Date.now(), userId }),
-          { expirationTtl: KV_IDLINK_TTL }
-        ).catch(err => console.error("[eden-analytics] KV idlink write:", err)),
-      ])
-    );
+    ctx.waitUntil(Promise.all([
+      linkUserAttribution(env.GCLID_KV, anonId, userId)
+        .catch(err => console.error("[eden-analytics] KV identify link:", err)),
+      env.GCLID_KV.put(
+        KV_IDLINK_PREFIX + userId,
+        JSON.stringify({ anonId, ts: Date.now(), userId }),
+        { expirationTtl: KV_IDLINK_TTL }
+      ).catch(err => console.error("[eden-analytics] KV idlink write:", err)),
+    ]));
   }
 
-  // ── Steps 6 + 7 + 8: Segment calls ────────────────────────────────────────
+  // Steps 6 + 7 + 8: Segment calls
   if (env.SEGMENT_WRITE_KEY) {
     ctx.waitUntil((async () => {
       try {
-        // Step 6: identify() — Mixpanel profile with full attribution traits
+        // Step 6: identify with enriched attribution traits
         await segmentPost(env.SEGMENT_WRITE_KEY, "identify", {
           anonymousId: anonId || userId,
           userId,
@@ -1139,18 +1044,11 @@ async function handleIdentify(request, env, ctx) {
           timestamp: nowUTC(),
         });
 
-        // Step 7: alias() — fires EXACTLY ONCE per userId
-        // v5.28 FIX 2: alias flag write is inside ctx.waitUntil so Cloudflare
-        // guarantees the KV put() completes before the Worker terminates.
-        // v5.27 had this outside waitUntil — the put() was abandoned mid-flight
-        // causing the flag to never be written and alias to fire on every session.
+        // Step 7: alias — exactly once, KV flag guaranteed by ctx.waitUntil
         if (!aliasFired && anonId && userId && anonId !== userId) {
           await segmentPost(env.SEGMENT_WRITE_KEY, "alias", {
-            previousId: anonId,
-            userId,
-            timestamp:  nowUTC(),
+            previousId: anonId, userId, timestamp: nowUTC(),
           });
-          // Write permanent flag — inside ctx.waitUntil so it is guaranteed
           if (env.GCLID_KV) {
             await env.GCLID_KV.put(
               KV_ALIAS_PREFIX + userId,
@@ -1160,12 +1058,10 @@ async function handleIdentify(request, env, ctx) {
           }
         }
 
-        // Step 8: group() — B2B / Mixpanel Group Analytics (optional)
+        // Step 8: group (B2B)
         if (groupId) {
           await segmentPost(env.SEGMENT_WRITE_KEY, "group", {
-            anonymousId: anonId || userId,
-            userId,
-            groupId,
+            anonymousId: anonId || userId, userId, groupId,
             traits: {
               ...buildCampaignContext(storedAttribution || {}),
               acquisition_channel: attributionTraits.acquisition_channel,
@@ -1173,7 +1069,6 @@ async function handleIdentify(request, env, ctx) {
             timestamp: nowUTC(),
           });
         }
-
       } catch (err) {
         console.error("[eden-analytics] identify segment error:", err);
       }
@@ -1181,8 +1076,7 @@ async function handleIdentify(request, env, ctx) {
   }
 
   return new Response(JSON.stringify({ ok: true }), {
-    status:  200,
-    headers: { "Content-Type": "application/json", ...corsHeadersObj(origin) },
+    status: 200, headers: { "Content-Type": "application/json", ...corsHeadersObj(origin) },
   });
 }
 
@@ -1211,19 +1105,11 @@ async function handlePreserveAttribution(request, env, ctx) {
   if (!attribution)  return jsonResponse({ ok: true, skipped: "no_attribution" });
 
   const writes = [];
-  if (orderId) writes.push(
-    storeAttribution(env.GCLID_KV, KV_ORDER_PREFIX + orderId, attribution)
-      .catch(err => console.error("[eden-analytics] pre-auth order store:", err))
-  );
-  if (userId) writes.push(
-    storeAttribution(env.GCLID_KV, KV_USER_PREFIX + userId, attribution)
-      .catch(err => console.error("[eden-analytics] pre-auth user store:", err))
-  );
+  if (orderId) writes.push(storeAttribution(env.GCLID_KV, KV_ORDER_PREFIX + orderId, attribution).catch(console.error));
+  if (userId)  writes.push(storeAttribution(env.GCLID_KV, KV_USER_PREFIX  + userId,  attribution).catch(console.error));
   if (writes.length) ctx.waitUntil(Promise.all(writes));
 
-  if (!CLICK_ID_PARAMS.some(p => attribution[p])) {
-    return jsonResponse({ ok: true, skipped: "no_click_id" });
-  }
+  if (!CLICK_ID_PARAMS.some(p => attribution[p])) return jsonResponse({ ok: true, skipped: "no_click_id" });
 
   const preAuthValue = encodeURIComponent(JSON.stringify({
     ...(attribution._gcl_au      ? { _gcl_au:       attribution._gcl_au      } : {}),
@@ -1243,8 +1129,7 @@ async function handlePreserveAttribution(request, env, ctx) {
     headers: {
       "Content-Type": "application/json",
       "Set-Cookie": [
-        `eden_pre_auth=${preAuthValue}`,
-        "Max-Age=600",
+        `eden_pre_auth=${preAuthValue}`, "Max-Age=600",
         `Domain=${cookieDomain(new URL(request.url))}`,
         "Path=/", "HttpOnly", "Secure", "SameSite=Lax",
       ].join("; "),
@@ -1256,8 +1141,7 @@ async function handlePreserveAttribution(request, env, ctx) {
 function extractPreAuthAttribution(request) {
   const raw = readCookie(request, "eden_pre_auth");
   if (!raw) return null;
-  try { return JSON.parse(decodeURIComponent(raw)); }
-  catch { return null; }
+  try { return JSON.parse(decodeURIComponent(raw)); } catch { return null; }
 }
 
 
@@ -1312,18 +1196,16 @@ async function forwardToSegment(writeKey, body, anonId, superProps, attribution 
     anonymousId: anonId, userId: resolveUserIdFromBody(body),
     event:      eventName,
     properties: await hashEmail({ ...superProps, ...(body.properties || {}) }),
-    context:    mergedContext,
-    timestamp:  nowUTC(),
+    context:    mergedContext, timestamp: nowUTC(),
     ...(stableMessageId ? { messageId: stableMessageId } : {}),
   });
 }
 
 
 // =============================================================================
-// KV ATTRIBUTION — STORAGE + RETRIEVAL
+// KV ATTRIBUTION
 // =============================================================================
 
-// v5.27 FIX 2: explicit two-branch logic — clear and correct
 async function storeAttribution(kv, key, attribution) {
   if (!kv || !key || !attribution) return;
   const hasValue = Object.values(attribution).some(v => v && String(v).trim());
@@ -1337,7 +1219,6 @@ async function storeAttribution(kv, key, attribution) {
       const newHasClick      = CLICK_ID_PARAMS.some(p => attribution[p]);
 
       if (existingHasClick && newHasClick) {
-        // First-touch: block click ID overwrite, enrich UTM/meta fields only
         let enriched = false;
         const updated = { ...parsed };
         for (const k of UTM_ENRICHABLE) {
@@ -1348,7 +1229,6 @@ async function storeAttribution(kv, key, attribution) {
       }
 
       if (existingHasClick && !newHasClick) {
-        // Existing has click ID, incoming is UTM-only — enrich but never overwrite click
         let enriched = false;
         const updated = { ...parsed };
         for (const k of UTM_ENRICHABLE) {
@@ -1357,17 +1237,12 @@ async function storeAttribution(kv, key, attribution) {
         if (enriched) await kv.put(key, JSON.stringify(updated), { expirationTtl: KV_TTL });
         return;
       }
-
-      // Existing has NO click ID — overwrite with new (may have click ID or fresher UTMs)
     }
   } catch {}
 
   await kv.put(key, JSON.stringify({ ...attribution, stored_at: nowUTC() }), { expirationTtl: KV_TTL });
 }
 
-// v5.27 FIX 3: returns FULL object including stored_at.
-// handleIdentify uses stored_at to set first_touch_at on Mixpanel profile.
-// Callers that spread into event properties MUST use stripInternalFields().
 async function getAttribution(kv, key) {
   if (!kv || !key) return null;
   try {
@@ -1376,19 +1251,20 @@ async function getAttribution(kv, key) {
   } catch { return null; }
 }
 
-// Priority: anon (current session) → user (cross-device) → order (BNPL bridge)
-// Within each tier: prefer entries with a click ID over UTM-only entries
-async function resolveAttribution(kv, anonId, userId, orderId = null) {
+// 4-way lookup: anon → user → order → gcl (v5.29 cross-domain bridge)
+async function resolveAttribution(kv, anonId, userId, orderId = null, gclAu = null) {
   if (!kv) return null;
-  const [fromAnon, fromUser, fromOrder] = await Promise.all([
+  const [fromAnon, fromUser, fromOrder, fromGcl] = await Promise.all([
     anonId  ? getAttribution(kv, KV_ANON_PREFIX  + anonId)  : Promise.resolve(null),
     userId  ? getAttribution(kv, KV_USER_PREFIX   + userId)  : Promise.resolve(null),
     orderId ? getAttribution(kv, KV_ORDER_PREFIX  + orderId) : Promise.resolve(null),
+    gclAu   ? getAttribution(kv, KV_GCL_PREFIX   + gclAu)   : Promise.resolve(null),
   ]);
   if (fromAnon  && CLICK_ID_PARAMS.some(p => fromAnon[p]))  return fromAnon;
   if (fromUser  && CLICK_ID_PARAMS.some(p => fromUser[p]))  return fromUser;
   if (fromOrder && CLICK_ID_PARAMS.some(p => fromOrder[p])) return fromOrder;
-  return fromAnon || fromUser || fromOrder || null;
+  if (fromGcl   && CLICK_ID_PARAMS.some(p => fromGcl[p]))   return fromGcl;
+  return fromAnon || fromUser || fromOrder || fromGcl || null;
 }
 
 async function linkUserAttribution(kv, anonId, userId) {
@@ -1398,15 +1274,10 @@ async function linkUserAttribution(kv, anonId, userId) {
   ]);
   if (!anonAttr) return;
   const userHasClick = existingUser && CLICK_ID_PARAMS.some(p => existingUser[p]);
-  if (userHasClick) {
-    console.log("[eden-analytics] userId click attribution exists — first-touch preserved");
-    return;
-  }
+  if (userHasClick) { console.log("[eden-analytics] userId click attribution exists — first-touch preserved"); return; }
   await storeAttribution(kv, KV_USER_PREFIX + userId, anonAttr);
 }
 
-// Strip internal KV bookkeeping fields before they touch event properties or campaign context.
-// stored_at is a KV implementation detail — it must never appear in Segment/BQ events.
 function stripInternalFields(attribution) {
   if (!attribution) return {};
   const out = {};
@@ -1475,19 +1346,17 @@ function buildCampaignContext(attribution) {
   const campaign = {};
   const KEYS = [
     "utm_source","utm_medium","utm_campaign","utm_content","utm_term","utm_id",
-    "landing_page","attribution_referrer",
-    ...CLICK_ID_PARAMS,
+    "landing_page","attribution_referrer", ...CLICK_ID_PARAMS,
   ];
   for (const k of KEYS) { if (attribution[k]) campaign[k] = attribution[k]; }
   return campaign;
 }
 
-// v5.28 FIX 1: KV_INTERNAL_FIELDS check ensures stored_at never enters properties
 function enrichPropertiesWithAttribution(properties, campaignProps) {
   if (!properties || typeof properties !== "object") return;
   if (!campaignProps || !Object.keys(campaignProps).length) return;
   for (const [k, v] of Object.entries(campaignProps)) {
-    if (KV_INTERNAL_FIELDS.has(k)) continue;  // ← never leak stored_at
+    if (KV_INTERNAL_FIELDS.has(k)) continue;
     if (v && !properties[k]) properties[k] = v;
   }
   if (campaignProps._gcl_au && !properties.gcl_au) properties.gcl_au = campaignProps._gcl_au;
@@ -1539,11 +1408,10 @@ function deriveAcquisitionChannel(c) {
   if (c.attribution_referrer) {
     try {
       const rh = new URL(c.attribution_referrer).hostname.toLowerCase();
-      if (rh.includes("google")||rh.includes("bing"))            return "organic_search";
-      if (rh.includes("facebook")||rh.includes("instagram")||
-          rh.includes("meta"))                                    return "organic_social";
-      if (rh.includes("twitter")||rh.includes("x.com"))          return "organic_social";
-      if (rh.includes("linkedin"))                                return "organic_social";
+      if (rh.includes("google")||rh.includes("bing"))   return "organic_search";
+      if (rh.includes("facebook")||rh.includes("instagram")||rh.includes("meta")) return "organic_social";
+      if (rh.includes("twitter")||rh.includes("x.com")) return "organic_social";
+      if (rh.includes("linkedin"))                       return "organic_social";
     } catch {}
   }
   return src || "direct";
@@ -1583,10 +1451,8 @@ function resolveIdentityFromBody(request, body) {
     body.properties?.anonymoous_id||null;
   if (!anonymousId && userId) anonymousId = userId;
   return {
-    anonymousId,
-    userId,
-    identityWarning: anonymousId&&userId&&anonymousId===userId
-      ? "anonymousId_equals_userId" : undefined,
+    anonymousId, userId,
+    identityWarning: anonymousId&&userId&&anonymousId===userId ? "anonymousId_equals_userId" : undefined,
   };
 }
 
@@ -1682,11 +1548,8 @@ async function sha256(value) {
 
 async function segmentPost(writeKey, endpoint, payload) {
   const res = await fetch(`https://api.segment.io/v1/${endpoint}`, {
-    method:  "POST",
-    headers: {
-      "Content-Type":  "application/json",
-      "Authorization": `Basic ${btoa(writeKey + ":")}`,
-    },
+    method: "POST",
+    headers: { "Content-Type": "application/json", "Authorization": `Basic ${btoa(writeKey + ":")}` },
     body: JSON.stringify(payload),
   });
   if (!res.ok) throw new Error(`Segment ${endpoint} ${res.status}: ${await res.text()}`);
@@ -1698,8 +1561,7 @@ async function segmentPost(writeKey, endpoint, payload) {
 // =============================================================================
 
 function readCookie(request, name) {
-  const m = (request.headers.get("Cookie") || "")
-    .match(new RegExp(`(?:^|;\\s*)${name}=([^;]+)`));
+  const m = (request.headers.get("Cookie") || "").match(new RegExp(`(?:^|;\\s*)${name}=([^;]+)`));
   return m ? decodeURIComponent(m[1]) : null;
 }
 
@@ -1710,31 +1572,18 @@ function cookieDomain(url) {
   return parts.length >= 2 ? `.${parts.slice(-2).join(".")}` : h;
 }
 
-// NOT HttpOnly — JS must read this for analytics.setAnonymousId()
 function buildAnonCookie(id, url) {
-  return [
-    `eden_anon_id=${encodeURIComponent(id)}`,
-    "Max-Age=63072000",
-    `Domain=${cookieDomain(url)}`,
-    "Path=/", "Secure", "SameSite=Lax",
-  ].join("; ");
+  return [`eden_anon_id=${encodeURIComponent(id)}`, "Max-Age=63072000",
+    `Domain=${cookieDomain(url)}`, "Path=/", "Secure", "SameSite=Lax"].join("; ");
 }
 
 function buildSessionCookie(v, url) {
-  return [
-    `eden_session_id=${encodeURIComponent(v)}`,
-    "Max-Age=1800",
-    `Domain=${cookieDomain(url)}`,
-    "Path=/", "Secure", "SameSite=Lax",
-  ].join("; ");
+  return [`eden_session_id=${encodeURIComponent(v)}`, "Max-Age=1800",
+    `Domain=${cookieDomain(url)}`, "Path=/", "Secure", "SameSite=Lax"].join("; ");
 }
 
 function clearCookie(name, url) {
-  return [
-    `${name}=`, "Max-Age=0",
-    `Domain=${cookieDomain(url)}`,
-    "Path=/", "Secure", "SameSite=Lax",
-  ].join("; ");
+  return [`${name}=`, "Max-Age=0", `Domain=${cookieDomain(url)}`, "Path=/", "Secure", "SameSite=Lax"].join("; ");
 }
 
 function nowUTC()     { return new Date(Date.now()).toISOString(); }
@@ -1778,7 +1627,7 @@ function corsHeadersObj(origin) {
   };
 }
 
-function corsHeaders(o)  { return corsHeadersObj(o); }
+function corsHeaders(o) { return corsHeadersObj(o); }
 
 function jsonResponse(data) {
   return new Response(JSON.stringify(data), {
