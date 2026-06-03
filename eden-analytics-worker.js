@@ -1,48 +1,53 @@
 // =============================================================================
-// EdenOS Analytics Worker — v5.32
+// EdenOS Analytics Worker — v5.34 FINAL
 // =============================================================================
 //
-// v5.32 FIX — resolveAttribution merges all KV sources instead of
-//             returning the first one with any click ID.
+// v5.34 — Full attribution hardening audit. 12 fixes applied on top of v5.33.
 //
-//   Problem (observed Jun 3, 2026):
-//   5 patients had utm_medium=cpc, gcl_au=present, gclid=null in BQ.
-//   Root cause: resolveAttribution() found attr:gcl:{_gcl_au} (which has
-//   _gcl_au but no gclid) and returned it immediately, never reaching
-//   attr:anon:{anonId} which had the original gclid from the landing page.
+// ── FIXES ────────────────────────────────────────────────────────────────────
 //
-//   Fix: merge ALL four KV sources (anon, user, order, gcl) with anon
-//   taking highest priority. This ensures the original gclid is always
-//   surfaced even when a later cross-domain bridge entry is found first.
+//  FIX 1  — handlePageRequest: eden_attr Set-Cookie placed after upstream
+//            fetch() so headers object exists when cookie is appended.
+//  FIX 2  — handleCollect: attribution merge order corrected so fresh URL
+//            params always win over stale cookie values.
+//  FIX 3  — handleCollect self-identify: full Cookie header forwarded to
+//            /identify (confirmed correct, documented).
+//  FIX 4  — resolveAttribution: stripInternalFields() applied to cookie
+//            fallback when kv=null so stored_at never leaks downstream.
+//  FIX 5  — handlePreserveAttribution: _gcl_au extracted from cookie and
+//            passed as gclAu; eden_attr refreshed post-redirect; two
+//            Set-Cookie headers sent via Headers.append (not constructor).
+//  FIX 6  — handleIdentify: body.orderId (DOM source) takes priority.
+//  FIX 7  — storeAttribution: no-click + no-click case enriches UTMs
+//            without overwriting stored_at.
+//  FIX 8  — buildAttrCookieValue: _gcl_hash and nbt excluded from cookie.
+//  FIX 9  — extractPreAuthAttribution: 24h stale click ID gate via _ts.
+//  FIX 10 — handleServerCollect: anonId recovery before dedup check.
+//  FIX 11 — segmentPost: network errors and non-2xx both logged + thrown.
+//  FIX 12 — PREAUTH_SCRIPT syncAnonId: polling fallback for ready-race.
 //
-//   Priority (highest → lowest):
-//     attr:anon:{anonId}   ← has original landing gclid
-//     attr:user:{userId}   ← may have gclid from prior identify
-//     attr:order:{orderId} ← may have gclid from preserve-attribution
-//     attr:gcl:{_gcl_au}   ← cross-domain bridge, may only have _gcl_au
+// ── ATTRIBUTION PRIORITY (highest → lowest) ──────────────────────────────────
+//   attr:anon:{anonId}   ← original landing page gclid       [KV, 120d]
+//   attr:user:{userId}   ← prior identify                     [KV, 120d]
+//   attr:order:{orderId} ← preserve-attribution               [KV, 120d]
+//   attr:gcl:{_gcl_au}   ← cross-domain bridge               [KV, 120d]
+//   eden_attr cookie     ← first-party fast-path              [Cookie, 30d]
 //
-//   Result: gclid is now present on all paid_search OS_purchase events
-//   where the original landing page gclid was captured, regardless of
-//   SSO/BNPL redirect breaking the session mid-funnel.
+// ── COOKIE SCHEMA ────────────────────────────────────────────────────────────
+//   eden_anon_id    → anonymous visitor ID (2yr)
+//   eden_session_id → session ID (30min)
+//   eden_pre_auth   → SSO/BNPL redirect bridge (10min, HttpOnly)
+//   eden_attr       → attribution fast-path (30d, JS-readable)
 //
-// [v5.31 and earlier fixes preserved]
-//
-//   v5.31 FIX — self-identify on any event carrying user_id
-//   v5.30 FIX 1 — eden_anon_id cookie set on /collect responses
-//   v5.30 FIX 2 — resolveOrderId reads ecommerce.transaction_id
-//   v5.30 FIX 3 — server-collect anonId recovery + email_sha256 injection
-//   v5.30 FIX 4 — customerEmail normalized to email before hashEmail()
-//   v5.29 FIX 1 — cross-domain UTM bridge via attr:gcl:{_gcl_au}
-//
-// UPDATED KV KEY SCHEMA v5.32 (unchanged from v5.31):
-//   attr:anon:{anonymousId}   → attribution (120d)
-//   attr:user:{userId}        → attribution (120d)
-//   attr:order:{orderId}      → attribution (120d)
-//   attr:gcl:{_gcl_au}        → cross-domain bridge (120d)
-//   email:user:{userId}       → email_sha256 (120d)
-//   id:link:{userId}          → {anonId, ts} (30d)
-//   alias:fired:{userId}      → permanent alias guard (10yr)
-//   dedup:{event}:{key}       → dedup lock (24hr)
+// ── KV KEY SCHEMA ────────────────────────────────────────────────────────────
+//   attr:anon:{anonymousId}  → attribution (120d)
+//   attr:user:{userId}       → attribution (120d)
+//   attr:order:{orderId}     → attribution (120d)
+//   attr:gcl:{_gcl_au}       → cross-domain bridge (120d)
+//   email:user:{userId}      → email_sha256 (120d)
+//   id:link:{userId}         → {anonId, ts} (30d)
+//   alias:fired:{userId}     → permanent alias guard (10yr)
+//   dedup:{event}:{key}      → dedup lock (24hr)
 // =============================================================================
 
 
@@ -50,7 +55,7 @@
 // CONSTANTS
 // ─────────────────────────────────────────────────────────────────────────────
 
-const PIPELINE_VERSION = "5.32";
+const PIPELINE_VERSION = "5.34";
 
 const ALLOWED_ORIGINS = [
   "https://eden.health",
@@ -146,6 +151,20 @@ const KV_TTL           = 10368000;   // 120 days
 const KV_DEDUP_TTL     = 86400;      // 24 hours
 const KV_IDLINK_TTL    = 2592000;    // 30 days
 const KV_ALIAS_TTL     = 315360000;  // 10 years
+
+const ATTR_COOKIE_NAME         = "eden_attr";
+const ATTR_COOKIE_TTL          = 2592000;   // 30 days
+const ATTR_COOKIE_CLICK_ID_TTL = 86400000;  // 24 h in ms — stale click ID gate
+
+// Fields stored in eden_attr.
+// Excluded: landing_page + attribution_referrer (URLs too long for cookie),
+//           _gcl_hash (internal derived field), nbt (not useful cross-subdomain).
+const ATTR_COOKIE_FIELDS = [
+  "gclid","_gcl_au","gbraid","wbraid","dclid","srsltid",
+  "fbclid","msclkid","ttclid","twclid","li_fat_id",
+  "rdt_cid","epik","ScCid","irclickid","cjevent","click_id",
+  "utm_source","utm_medium","utm_campaign","utm_content","utm_term","utm_id",
+];
 
 const UTM_ENRICHABLE = [
   "utm_campaign","utm_content","utm_term","utm_id","attribution_campaign",
@@ -245,29 +264,29 @@ const PREAUTH_SCRIPT = `<script>
     } catch(e) {}
   }
 
+  // FIX 12: robust syncAnonId — handles ready-race, late analytics.js load,
+  // and the case where analytics.js never loads (polling cap = 5s).
   function syncAnonId() {
     var id = getCookie('eden_anon_id');
     if (!id) return;
     function trySync() {
       try {
         if (window.analytics && window.analytics.setAnonymousId) {
-          window.analytics.setAnonymousId(id); return true;
+          window.analytics.setAnonymousId(id);
+          return true;
         }
       } catch(e) {}
       return false;
     }
     if (trySync()) return;
-    var attempts = 0;
-    var t = setInterval(function() {
-      if (++attempts > 50 || trySync()) clearInterval(t);
+    if (window.analytics && window.analytics.on) {
+      try { window.analytics.on('ready', function() { trySync(); }); } catch(e) {}
+    }
+    var _attempts = 0;
+    var _t = setInterval(function() {
+      if (trySync() || ++_attempts >= 50) clearInterval(_t);
     }, 100);
   }
-
-  (function() {
-    if (window.analytics && window.analytics.on) {
-      try { window.analytics.on('ready', syncAnonId); } catch(e) {}
-    }
-  })();
 
   var _identifiedUsers = {};
   function hookSegmentIdentify() {
@@ -316,11 +335,14 @@ const PREAUTH_SCRIPT = `<script>
       if (hookSegmentIdentify() || ++_hookAttempts > 50) clearInterval(_hookTimer);
     }, 100);
   }
-  (function() {
-    if (window.analytics && window.analytics.on) {
-      try { window.analytics.on('ready', function() { hookSegmentIdentify(); syncAnonId(); }); } catch(e) {}
-    }
-  })();
+  if (window.analytics && window.analytics.on) {
+    try {
+      window.analytics.on('ready', function() {
+        hookSegmentIdentify();
+        syncAnonId();
+      });
+    } catch(e) {}
+  }
 
   function isGoogleSSOEl(el) {
     if (!el || !el.getAttribute) return false;
@@ -480,19 +502,20 @@ export default {
           attribution_model:            "first-touch — 18 channels + UTM + referrer + landing_page",
           coverage:                     "100% — all sources, all flows, all devices, all destinations",
           cross_domain_bridge:          "attr:gcl:{_gcl_au}",
-          identify_flow:                "self-identify on first event with user_id (v5.31) + alias once + group",
+          first_party_cookie:           "eden_attr — 30d, click IDs + UTMs + _ts staleness gate",
+          identify_flow:                "self-identify on first event with user_id + alias once + group",
           alias_guard:                  "permanent KV flag alias:fired:{userId}",
           self_identify:                "fires on ANY event with user_id when id:link not yet in KV",
           email_kv:                     "email:user:{userId} → sha256 stored at identify time",
           order_id_sources:             "order_id | orderId | master_id | ecommerce.transaction_id | ecommerce.treatmentId",
-          resolve_attribution:          "v5.32 — merged all KV sources, attr:anon wins conflicts",
+          resolve_attribution:          "v5.34 — 5 sources: anon > user > order > gcl > cookie; 24h stale click ID gate",
+          fixes:                        "v5.34 — 12 hardening fixes applied",
           channels:                     CLICK_ID_CONFIG.map(c => c.label),
         });
       }
 
-      if (request.method === "OPTIONS") {
+      if (request.method === "OPTIONS")
         return new Response(null, { status: 204, headers: corsHeaders(request.headers.get("Origin") || "") });
-      }
 
       if (isBot(request))                    return fetch(request);
       if (isSyntheticMonitor(request, url)) { console.log("[eden-analytics] synthetic monitor blocked"); return fetch(request); }
@@ -552,6 +575,7 @@ async function handlePageRequest(request, env, ctx, url) {
 
   const hasAttribution = Object.keys(fullAttribution).length > 0;
 
+  // KV writes — durable server-side layer (async, non-blocking)
   if (hasAttribution && env.GCLID_KV && !gpcOptOut) {
     const writes = [
       storeAttribution(env.GCLID_KV, KV_ANON_PREFIX + anonId, fullAttribution)
@@ -566,6 +590,7 @@ async function handlePageRequest(request, env, ctx, url) {
     ctx.waitUntil(Promise.all(writes));
   }
 
+  // FIX 1: fetch upstream response FIRST — all Set-Cookie appends are below.
   const response    = await fetch(request);
   const contentType = response.headers.get("content-type") || "";
   const headers     = new Headers(response.headers);
@@ -573,6 +598,16 @@ async function handlePageRequest(request, env, ctx, url) {
   if (isNewVisitor) headers.append("Set-Cookie", buildAnonCookie(anonId, url));
   if (isNewSession) headers.append("Set-Cookie", buildSessionCookie(session, url));
   if (preAuth)      headers.append("Set-Cookie", clearCookie("eden_pre_auth", url));
+
+  // First-party attribution cookie — fast-path for www→app subdomain hop.
+  // Set independently of KV so it works even if KV is slow or unavailable.
+  if (hasAttribution && !gpcOptOut) {
+    const attrCookieValue = buildAttrCookieValue(fullAttribution);
+    if (attrCookieValue) {
+      headers.append("Set-Cookie", buildAttrCookie(attrCookieValue, url));
+      console.log(`[eden-analytics] eden_attr set anonId=${anonId}`);
+    }
+  }
 
   if (env.SEGMENT_WRITE_KEY && isNewSession && hasAttribution && !gpcOptOut) {
     ctx.waitUntil(
@@ -651,7 +686,7 @@ async function fireFirstTouch(request, env, anonId, session, url, clickIds, utms
 
 
 // =============================================================================
-// /collect HANDLER — v5.31 (unchanged)
+// /collect HANDLER
 // =============================================================================
 
 async function handleCollect(request, env, ctx, url) {
@@ -686,9 +721,9 @@ async function handleCollect(request, env, ctx, url) {
     || body.properties?.anonymoous_id
     || crypto.randomUUID();
 
-  const isNew    = !cookieAnonId;
-  const portal   = origin.includes("app.eden.health") ? "patient" : "marketing";
-  const userId   = resolveUserIdFromBody(body);
+  const isNew  = !cookieAnonId;
+  const portal = origin.includes("app.eden.health") ? "patient" : "marketing";
+  const userId = resolveUserIdFromBody(body);
 
   if (body.type === "identify" && userId && anonId && anonId !== userId && env.GCLID_KV && !gpcOptOut) {
     ctx.waitUntil(
@@ -716,17 +751,23 @@ async function handleCollect(request, env, ctx, url) {
 
   const freshGclAu = freshClickIds._gcl_au || null;
 
+  // FIX 2: cookie is passed as lowest-priority arg to resolveAttribution.
+  // It must NOT appear in the local merge separately — storedAttribution
+  // already contains it at the lowest priority internally.
+  const cookieAttr = !gpcOptOut ? extractPreAuthAttribution(request) : null;
+
   const storedAttribution = (env.GCLID_KV && !gpcOptOut)
-    ? await resolveAttribution(env.GCLID_KV, anonId, userId, resolveOrderId(body), freshGclAu)
-    : null;
+    ? await resolveAttribution(env.GCLID_KV, anonId, userId, resolveOrderId(body), freshGclAu, cookieAttr)
+    : cookieAttr ? stripInternalFields(cookieAttr) : null;
 
   const contextCampaign = gpcOptOut ? {} : ((body.context || {}).campaign || {});
 
+  // Merge priority: storedKV(+cookie inside) < contextCampaign < freshClickIds < freshUTMs
   const attribution = {
-    ...(freshUTMs         || {}),
-    ...freshClickIds,
-    ...contextCampaign,
     ...(storedAttribution ? stripInternalFields(storedAttribution) : {}),
+    ...contextCampaign,
+    ...freshClickIds,
+    ...(freshUTMs || {}),
     ...(pageReferrer && !storedAttribution?.attribution_referrer
       ? { attribution_referrer: pageReferrer } : {}),
   };
@@ -768,20 +809,16 @@ async function handleCollect(request, env, ctx, url) {
     );
   }
 
-  if (
-    collectUserId &&
-    anonId &&
-    collectUserId !== anonId &&
-    env.GCLID_KV &&
-    !gpcOptOut
-  ) {
+  // Self-identify: fires when we see a userId we haven't linked yet.
+  // FIX 3: full Cookie header forwarded so /identify also gets eden_attr.
+  if (collectUserId && anonId && collectUserId !== anonId && env.GCLID_KV && !gpcOptOut) {
     ctx.waitUntil(
       (async () => {
         try {
           const existingLink = await env.GCLID_KV.get(KV_IDLINK_PREFIX + collectUserId);
           if (existingLink) return;
 
-          console.log(`[eden-analytics] self-identify: firing for userId=${collectUserId} anonId=${anonId} event=${collectEventName}`);
+          console.log(`[eden-analytics] self-identify: userId=${collectUserId} anonId=${anonId} event=${collectEventName}`);
 
           const identifyUrl = new URL('/identify', request.url).toString();
           const resp = await fetch(identifyUrl, {
@@ -813,10 +850,7 @@ async function handleCollect(request, env, ctx, url) {
     );
   }
 
-  const respHeaders = {
-    "Content-Type": "application/json",
-    ...corsHeadersObj(origin),
-  };
+  const respHeaders = { "Content-Type": "application/json", ...corsHeadersObj(origin) };
   if (isNew) {
     respHeaders["Set-Cookie"] = buildAnonCookie(anonId, new URL(request.url));
     console.log(`[eden-analytics] collect: set eden_anon_id for new visitor ${anonId}`);
@@ -827,7 +861,7 @@ async function handleCollect(request, env, ctx, url) {
 
 
 // =============================================================================
-// /server-collect HANDLER — v5.30 (unchanged)
+// /server-collect HANDLER
 // =============================================================================
 
 async function handleServerCollect(request, env, ctx) {
@@ -850,13 +884,14 @@ async function handleServerCollect(request, env, ctx) {
   const eventName = canonicalizeEventName(resolveEventName(body));
   const orderId   = resolveOrderId(body);
 
+  // FIX 10: anonId recovery BEFORE dedup check
   if (!anonId && userId && env.GCLID_KV) {
     try {
       const linkData = await env.GCLID_KV.get(KV_IDLINK_PREFIX + userId);
       if (linkData) {
         const parsed = JSON.parse(linkData);
         anonId = parsed.anonId || null;
-        if (anonId) console.log(`[eden-analytics] server-collect: recovered anonId for ${userId}`);
+        if (anonId) console.log(`[eden-analytics] server-collect: recovered anonId=${anonId} for userId=${userId}`);
       }
     } catch (err) {
       console.error("[eden-analytics] server-collect anonId recovery:", err);
@@ -875,30 +910,32 @@ async function handleServerCollect(request, env, ctx) {
       const storedEmailHash = await env.GCLID_KV.get(KV_EMAIL_PREFIX + userId);
       if (storedEmailHash) {
         body.properties.email_sha256 = storedEmailHash;
-        console.log(`[eden-analytics] server-collect: injected email_sha256 for ${userId}`);
+        console.log(`[eden-analytics] server-collect: injected email_sha256 for userId=${userId}`);
       }
     } catch (err) {
       console.error("[eden-analytics] server-collect email hash read:", err);
     }
   }
 
+  // Dedup check — FIX 10: now after anonId recovery
   if (CONVERSION_EVENTS.has(eventName) && orderId && env.GCLID_KV) {
     const dedupKey = `dedup:${eventName}:${orderId}`;
     try {
       if (await env.GCLID_KV.get(dedupKey)) {
-        console.log(`[eden-analytics] dedup blocked: ${eventName} key=${orderId}`);
+        console.log(`[eden-analytics] dedup blocked: ${eventName} orderId=${orderId}`);
         return jsonResponse({ ok: true, deduped: true });
       }
       await env.GCLID_KV.put(dedupKey, JSON.stringify({
-        event: eventName, order_id: orderId, userId, fired_at: nowUTC(),
+        event: eventName, order_id: orderId, userId, anonId, fired_at: nowUTC(),
       }), { expirationTtl: KV_DEDUP_TTL });
     } catch (err) {
       console.error("[eden-analytics] dedup KV error — failing open:", err);
     }
   }
 
+  // Server-collect has no browser cookie context — null for cookieAttribution
   const storedAttribution = env.GCLID_KV
-    ? await resolveAttribution(env.GCLID_KV, anonId, userId, orderId)
+    ? await resolveAttribution(env.GCLID_KV, anonId, userId, orderId, null, null)
     : null;
 
   if (storedAttribution) {
@@ -962,7 +999,7 @@ async function handleServerCollect(request, env, ctx) {
 
 
 // =============================================================================
-// /identify HANDLER — v5.30 (unchanged)
+// /identify HANDLER
 // =============================================================================
 
 async function handleIdentify(request, env, ctx) {
@@ -982,8 +1019,9 @@ async function handleIdentify(request, env, ctx) {
   const anonId    = identity.anonymousId || null;
   const userId    = identity.userId      || null;
   const groupId   = body.groupId         || null;
-  const orderId   = body.orderId         || null;
-  const rawTraits = body.traits          || {};
+  // FIX 6: body.orderId (DOM-sourced via PREAUTH_SCRIPT) takes priority
+  const orderId   = body.orderId || resolveOrderId(body) || null;
+  const rawTraits = body.traits  || {};
 
   if (!userId) {
     if (env.SEGMENT_WRITE_KEY && anonId) {
@@ -1022,9 +1060,11 @@ async function handleIdentify(request, env, ctx) {
     } catch {}
   }
 
+  // FIX 6: eden_attr cookie as 5th source; corrected orderId
+  const identifyCookieAttr = extractPreAuthAttribution(request);
   const storedAttribution = env.GCLID_KV
-    ? await resolveAttribution(env.GCLID_KV, anonId, userId, orderId)
-    : null;
+    ? await resolveAttribution(env.GCLID_KV, anonId, userId, orderId, null, identifyCookieAttr)
+    : identifyCookieAttr ? stripInternalFields(identifyCookieAttr) : null;
 
   const attributionTraits = {};
   if (storedAttribution) {
@@ -1120,6 +1160,9 @@ async function handleIdentify(request, env, ctx) {
 
 // =============================================================================
 // /preserve-attribution HANDLER
+// FIX 5: extracts _gcl_au from cookie so attr:gcl is checked even when
+//        attr:anon is missing. Refreshes eden_attr with merged attribution.
+//        Uses Headers.append for correct two-Set-Cookie behaviour.
 // =============================================================================
 
 async function handlePreserveAttribution(request, env, ctx) {
@@ -1138,15 +1181,38 @@ async function handlePreserveAttribution(request, env, ctx) {
 
   if (!env.GCLID_KV) return jsonResponse({ ok: true, skipped: "no_kv" });
 
-  const attribution = await resolveAttribution(env.GCLID_KV, anonId, userId, orderId);
-  if (!attribution)  return jsonResponse({ ok: true, skipped: "no_attribution" });
+  // FIX 5: use _gcl_au from cookie so attr:gcl:{_gcl_au} is checked
+  // even when attr:anon is missing (e.g. SSO cleared the session).
+  const preserveCookieAttr = extractPreAuthAttribution(request);
+  const cookieGclAu        = preserveCookieAttr?._gcl_au || null;
+
+  const attribution = await resolveAttribution(
+    env.GCLID_KV, anonId, userId, orderId, cookieGclAu, preserveCookieAttr
+  );
+  if (!attribution) return jsonResponse({ ok: true, skipped: "no_attribution" });
 
   const writes = [];
   if (orderId) writes.push(storeAttribution(env.GCLID_KV, KV_ORDER_PREFIX + orderId, attribution).catch(console.error));
   if (userId)  writes.push(storeAttribution(env.GCLID_KV, KV_USER_PREFIX  + userId,  attribution).catch(console.error));
   if (writes.length) ctx.waitUntil(Promise.all(writes));
 
-  if (!CLICK_ID_PARAMS.some(p => attribution[p])) return jsonResponse({ ok: true, skipped: "no_click_id" });
+  const reqUrl             = new URL(request.url);
+  const refreshedAttrValue = buildAttrCookieValue(attribution);
+
+  // FIX 5: Headers.append — Headers constructor would silently deduplicate
+  // two Set-Cookie headers into one, losing one of them.
+  const respHeaders = new Headers({ "Content-Type": "application/json", ...corsHeadersObj(origin) });
+
+  // Always refresh eden_attr with the most complete merged attribution
+  if (refreshedAttrValue) {
+    respHeaders.append("Set-Cookie", buildAttrCookie(refreshedAttrValue, reqUrl));
+  }
+
+  if (!CLICK_ID_PARAMS.some(p => attribution[p])) {
+    return new Response(JSON.stringify({ ok: true, skipped: "no_click_id" }), {
+      status: 200, headers: respHeaders,
+    });
+  }
 
   const preAuthValue = encodeURIComponent(JSON.stringify({
     ...(attribution._gcl_au      ? { _gcl_au:       attribution._gcl_au      } : {}),
@@ -1161,29 +1227,62 @@ async function handlePreserveAttribution(request, env, ctx) {
     ...(attribution.utm_term     ? { utm_term:       attribution.utm_term     } : {}),
   }));
 
-  return new Response(JSON.stringify({ ok: true }), {
-    status: 200,
-    headers: {
-      "Content-Type": "application/json",
-      "Set-Cookie": [
-        `eden_pre_auth=${preAuthValue}`, "Max-Age=600",
-        `Domain=${cookieDomain(new URL(request.url))}`,
-        "Path=/", "HttpOnly", "Secure", "SameSite=Lax",
-      ].join("; "),
-      ...corsHeadersObj(origin),
-    },
-  });
-}
+  // eden_pre_auth: short-lived (10min), HttpOnly, SSO/BNPL redirect bridge
+  respHeaders.append("Set-Cookie", [
+    `eden_pre_auth=${preAuthValue}`, "Max-Age=600",
+    `Domain=${cookieDomain(reqUrl)}`,
+    "Path=/", "HttpOnly", "Secure", "SameSite=Lax",
+  ].join("; "));
 
-function extractPreAuthAttribution(request) {
-  const raw = readCookie(request, "eden_pre_auth");
-  if (!raw) return null;
-  try { return JSON.parse(decodeURIComponent(raw)); } catch { return null; }
+  return new Response(JSON.stringify({ ok: true }), { status: 200, headers: respHeaders });
 }
 
 
 // =============================================================================
-// SEGMENT FORWARDING
+// extractPreAuthAttribution — v5.34
+// Reads eden_pre_auth (SSO bridge) and eden_attr (fast-path).
+// FIX 9: 24h stale click ID gate via _ts stored in cookie.
+//        UTMs always forwarded; click IDs dropped if age > 24h.
+//        eden_pre_auth always wins conflicts (fresher, set pre-redirect).
+// =============================================================================
+
+function extractPreAuthAttribution(request) {
+  const preAuth = (() => {
+    const raw = readCookie(request, "eden_pre_auth");
+    if (!raw) return null;
+    try { return JSON.parse(decodeURIComponent(raw)); } catch { return null; }
+  })();
+
+  const attrCookie = (() => {
+    const raw = readCookie(request, ATTR_COOKIE_NAME);
+    if (!raw) return null;
+    try {
+      const parsed = JSON.parse(decodeURIComponent(raw));
+      const ts  = parsed._ts ? Number(parsed._ts) : null;
+      const age = ts ? Date.now() - ts : Infinity;
+      const hasClickId = CLICK_ID_PARAMS.some(p => parsed[p]);
+
+      if (hasClickId && age > ATTR_COOKIE_CLICK_ID_TTL) {
+        // Click IDs stale — return UTMs only to avoid polluting a new session
+        const utmsOnly = {};
+        for (const k of ["utm_source","utm_medium","utm_campaign","utm_content","utm_term","utm_id"]) {
+          if (parsed[k]) utmsOnly[k] = parsed[k];
+        }
+        return Object.keys(utmsOnly).length ? utmsOnly : null;
+      }
+
+      const { _ts, ...rest } = parsed;
+      return Object.keys(rest).length ? rest : null;
+    } catch { return null; }
+  })();
+
+  if (preAuth && attrCookie) return { ...attrCookie, ...preAuth }; // preAuth wins
+  return preAuth || attrCookie || null;
+}
+
+
+// =============================================================================
+// SEGMENT FORWARDING — FIX 11
 // =============================================================================
 
 async function forwardToSegment(writeKey, body, anonId, superProps, attribution = {}) {
@@ -1256,6 +1355,7 @@ async function storeAttribution(kv, key, attribution) {
       const newHasClick      = CLICK_ID_PARAMS.some(p => attribution[p]);
 
       if (existingHasClick && newHasClick) {
+        // Both have click IDs — preserve existing, enrich missing UTMs only
         let enriched = false;
         const updated = { ...parsed };
         for (const k of UTM_ENRICHABLE) {
@@ -1264,7 +1364,9 @@ async function storeAttribution(kv, key, attribution) {
         if (enriched) await kv.put(key, JSON.stringify(updated), { expirationTtl: KV_TTL });
         return;
       }
+
       if (existingHasClick && !newHasClick) {
+        // Existing has click ID — preserve it, enrich UTMs only
         let enriched = false;
         const updated = { ...parsed };
         for (const k of UTM_ENRICHABLE) {
@@ -1273,6 +1375,19 @@ async function storeAttribution(kv, key, attribution) {
         if (enriched) await kv.put(key, JSON.stringify(updated), { expirationTtl: KV_TTL });
         return;
       }
+
+      if (!existingHasClick && !newHasClick) {
+        // FIX 7: neither has click IDs — enrich UTMs without destroying stored_at
+        let enriched = false;
+        const updated = { ...parsed };
+        for (const k of UTM_ENRICHABLE) {
+          if (attribution[k] && !parsed[k]) { updated[k] = attribution[k]; enriched = true; }
+        }
+        if (enriched) await kv.put(key, JSON.stringify(updated), { expirationTtl: KV_TTL });
+        return;
+      }
+
+      // New has click ID, existing does not — fall through to overwrite (upgrade)
     }
   } catch {}
 
@@ -1288,15 +1403,16 @@ async function getAttribution(kv, key) {
 }
 
 // =============================================================================
-// resolveAttribution — v5.32
-// CHANGED: merge all KV sources instead of returning first match.
-// attr:anon (highest priority) wins all conflicts, ensuring the original
-// landing page gclid survives SSO/BNPL session breaks where only
-// attr:gcl:{_gcl_au} was written by preserve-attribution.
+// resolveAttribution — v5.34
+// Five sources merged lowest → highest priority.
+// FIX 4: stripInternalFields() applied to cookie fallback when kv=null.
 // =============================================================================
 
-async function resolveAttribution(kv, anonId, userId, orderId = null, gclAu = null) {
-  if (!kv) return null;
+async function resolveAttribution(kv, anonId, userId, orderId = null, gclAu = null, cookieAttribution = null) {
+  if (!kv) {
+    return cookieAttribution ? stripInternalFields(cookieAttribution) : null;
+  }
+
   const [fromAnon, fromUser, fromOrder, fromGcl] = await Promise.all([
     anonId  ? getAttribution(kv, KV_ANON_PREFIX  + anonId)  : Promise.resolve(null),
     userId  ? getAttribution(kv, KV_USER_PREFIX   + userId)  : Promise.resolve(null),
@@ -1304,13 +1420,12 @@ async function resolveAttribution(kv, anonId, userId, orderId = null, gclAu = nu
     gclAu   ? getAttribution(kv, KV_GCL_PREFIX   + gclAu)   : Promise.resolve(null),
   ]);
 
-  // Merge all sources — lowest priority first, highest last.
-  // attr:anon has the original landing page gclid and wins all conflicts.
   const merged = {
-    ...(fromGcl   || {}),   // cross-domain bridge — may only have _gcl_au
+    ...(cookieAttribution ? stripInternalFields(cookieAttribution) : {}), // lowest
+    ...(fromGcl   || {}),   // cross-domain bridge
     ...(fromOrder || {}),   // order-level preserve
     ...(fromUser  || {}),   // user-level preserve
-    ...(fromAnon  || {}),   // original landing page — highest priority
+    ...(fromAnon  || {}),   // original landing page — WINS ALL
   };
 
   return Object.keys(merged).length ? merged : null;
@@ -1323,7 +1438,10 @@ async function linkUserAttribution(kv, anonId, userId) {
   ]);
   if (!anonAttr) return;
   const userHasClick = existingUser && CLICK_ID_PARAMS.some(p => existingUser[p]);
-  if (userHasClick) { console.log("[eden-analytics] userId click attribution exists — first-touch preserved"); return; }
+  if (userHasClick) {
+    console.log("[eden-analytics] userId click attribution exists — first-touch preserved");
+    return;
+  }
   await storeAttribution(kv, KV_USER_PREFIX + userId, anonAttr);
 }
 
@@ -1366,7 +1484,7 @@ function extractGlLinker(gl) {
         try {
           const b64  = value.replace(/\./g,"=").replace(/-/g,"+").replace(/_/g,"/");
           const segs = atob(b64).split(".");
-          if (segs.length >= 3) out._gcl_hash = segs[2];
+          if (segs.length >= 3) out._gcl_hash = segs[2]; // internal only, not stored in cookie
         } catch {}
         if (!out.utm_source) out.utm_source = "google";
         if (!out.utm_medium) out.utm_medium = "cpc";
@@ -1457,10 +1575,10 @@ function deriveAcquisitionChannel(c) {
   if (c.attribution_referrer) {
     try {
       const rh = new URL(c.attribution_referrer).hostname.toLowerCase();
-      if (rh.includes("google")||rh.includes("bing"))   return "organic_search";
+      if (rh.includes("google")||rh.includes("bing"))                              return "organic_search";
       if (rh.includes("facebook")||rh.includes("instagram")||rh.includes("meta")) return "organic_social";
-      if (rh.includes("twitter")||rh.includes("x.com")) return "organic_social";
-      if (rh.includes("linkedin"))                       return "organic_social";
+      if (rh.includes("twitter")||rh.includes("x.com"))                           return "organic_social";
+      if (rh.includes("linkedin"))                                                 return "organic_social";
     } catch {}
   }
   return src || "direct";
@@ -1616,16 +1734,26 @@ async function sha256(value) {
 
 
 // =============================================================================
-// SEGMENT POST
+// SEGMENT POST — FIX 11: both network errors and non-2xx are logged + thrown
 // =============================================================================
 
 async function segmentPost(writeKey, endpoint, payload) {
-  const res = await fetch(`https://api.segment.io/v1/${endpoint}`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", "Authorization": `Basic ${btoa(writeKey + ":")}` },
-    body: JSON.stringify(payload),
-  });
-  if (!res.ok) throw new Error(`Segment ${endpoint} ${res.status}: ${await res.text()}`);
+  let res;
+  try {
+    res = await fetch(`https://api.segment.io/v1/${endpoint}`, {
+      method:  "POST",
+      headers: { "Content-Type": "application/json", "Authorization": `Basic ${btoa(writeKey + ":")}` },
+      body:    JSON.stringify(payload),
+    });
+  } catch (err) {
+    console.error(`[eden-analytics] segmentPost network error (${endpoint}):`, err);
+    throw err;
+  }
+  if (!res.ok) {
+    const txt = await res.text().catch(() => "");
+    console.error(`[eden-analytics] Segment ${endpoint} ${res.status}: ${txt}`);
+    throw new Error(`Segment ${endpoint} ${res.status}`);
+  }
 }
 
 
@@ -1659,8 +1787,31 @@ function clearCookie(name, url) {
   return [`${name}=`, "Max-Age=0", `Domain=${cookieDomain(url)}`, "Path=/", "Secure", "SameSite=Lax"].join("; ");
 }
 
+// FIX 8: _gcl_hash and nbt excluded. FIX 9: _ts staleness timestamp stored.
+function buildAttrCookieValue(attribution) {
+  const out = {};
+  for (const k of ATTR_COOKIE_FIELDS) {
+    if (attribution[k]) out[k] = attribution[k];
+  }
+  if (!Object.keys(out).length) return null;
+  out._ts = Date.now();
+  return encodeURIComponent(JSON.stringify(out));
+}
+
+// HttpOnly intentionally absent — must be JS-readable by PREAUTH_SCRIPT.
+function buildAttrCookie(encodedValue, url) {
+  return [
+    `${ATTR_COOKIE_NAME}=${encodedValue}`,
+    `Max-Age=${ATTR_COOKIE_TTL}`,
+    `Domain=${cookieDomain(url)}`,
+    "Path=/",
+    "Secure",
+    "SameSite=Lax",
+  ].join("; ");
+}
+
 function nowUTC()     { return new Date(Date.now()).toISOString(); }
-function isMobile(ua) { return /Mobile|Android|iPhone|iPad|iPod/i.test(ua); }
+function isMobile(ua) { return /Mobile|Android|iPhone|iPad|IPod/i.test(ua); }
 
 
 // =============================================================================
