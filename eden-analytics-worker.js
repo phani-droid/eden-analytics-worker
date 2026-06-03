@@ -1,39 +1,46 @@
 // =============================================================================
-// EdenOS Analytics Worker — v5.31 FINAL
+// EdenOS Analytics Worker — v5.32
 // =============================================================================
 //
-// v5.31 CHANGE — self-identify on any event carrying user_id
+// v5.32 FIX — resolveAttribution merges all KV sources instead of
+//             returning the first one with any click ID.
 //
-//   Problem: Gowtham's app never calls analytics.identify(userId, traits).
-//   hookSegmentIdentify() has nothing to intercept → id:link, alias:fired,
-//   attr:user never written → userId: null on all events → attribution broken.
+//   Problem (observed Jun 3, 2026):
+//   5 patients had utm_medium=cpc, gcl_au=present, gclid=null in BQ.
+//   Root cause: resolveAttribution() found attr:gcl:{_gcl_au} (which has
+//   _gcl_au but no gclid) and returned it immediately, never reaching
+//   attr:anon:{anonId} which had the original gclid from the landing page.
 //
-//   Fix: On ANY /collect event where properties.user_id is present and
-//   id:link:{userId} does not yet exist in KV, worker self-triggers /identify.
-//   KV idempotency guard ensures this fires exactly once per userId ever.
-//   Zero app changes required.
+//   Fix: merge ALL four KV sources (anon, user, order, gcl) with anon
+//   taking highest priority. This ensures the original gclid is always
+//   surfaced even when a later cross-domain bridge entry is found first.
 //
-//   Why any event (not just OS_purchase):
-//   - OS_intake_started fires before OS_purchase → attr:user written earlier
-//   - By the time OS_purchase arrives, attr:user:{userId} already has gclid
-//   - resolveAttribution() finds it → gclid on purchase event ✅
-//   - KV check prevents redundant calls after first link
+//   Priority (highest → lowest):
+//     attr:anon:{anonId}   ← has original landing gclid
+//     attr:user:{userId}   ← may have gclid from prior identify
+//     attr:order:{orderId} ← may have gclid from preserve-attribution
+//     attr:gcl:{_gcl_au}   ← cross-domain bridge, may only have _gcl_au
 //
-// [v5.30 and earlier fixes preserved]
+//   Result: gclid is now present on all paid_search OS_purchase events
+//   where the original landing page gclid was captured, regardless of
+//   SSO/BNPL redirect breaking the session mid-funnel.
 //
+// [v5.31 and earlier fixes preserved]
+//
+//   v5.31 FIX — self-identify on any event carrying user_id
 //   v5.30 FIX 1 — eden_anon_id cookie set on /collect responses
 //   v5.30 FIX 2 — resolveOrderId reads ecommerce.transaction_id
 //   v5.30 FIX 3 — server-collect anonId recovery + email_sha256 injection
 //   v5.30 FIX 4 — customerEmail normalized to email before hashEmail()
 //   v5.29 FIX 1 — cross-domain UTM bridge via attr:gcl:{_gcl_au}
 //
-// UPDATED KV KEY SCHEMA v5.31:
+// UPDATED KV KEY SCHEMA v5.32 (unchanged from v5.31):
 //   attr:anon:{anonymousId}   → attribution (120d)
 //   attr:user:{userId}        → attribution (120d)
 //   attr:order:{orderId}      → attribution (120d)
 //   attr:gcl:{_gcl_au}        → cross-domain bridge (120d)
 //   email:user:{userId}       → email_sha256 (120d)
-//   id:link:{userId}          → {anonId, ts} (30d) ← also guards self-identify
+//   id:link:{userId}          → {anonId, ts} (30d)
 //   alias:fired:{userId}      → permanent alias guard (10yr)
 //   dedup:{event}:{key}       → dedup lock (24hr)
 // =============================================================================
@@ -43,7 +50,7 @@
 // CONSTANTS
 // ─────────────────────────────────────────────────────────────────────────────
 
-const PIPELINE_VERSION = "5.31";
+const PIPELINE_VERSION = "5.32";
 
 const ALLOWED_ORIGINS = [
   "https://eden.health",
@@ -478,6 +485,7 @@ export default {
           self_identify:                "fires on ANY event with user_id when id:link not yet in KV",
           email_kv:                     "email:user:{userId} → sha256 stored at identify time",
           order_id_sources:             "order_id | orderId | master_id | ecommerce.transaction_id | ecommerce.treatmentId",
+          resolve_attribution:          "v5.32 — merged all KV sources, attr:anon wins conflicts",
           channels:                     CLICK_ID_CONFIG.map(c => c.label),
         });
       }
@@ -643,8 +651,7 @@ async function fireFirstTouch(request, env, anonId, session, url, clickIds, utms
 
 
 // =============================================================================
-// /collect HANDLER — v5.31
-// NEW: self-identify on ANY event where user_id present + not yet linked
+// /collect HANDLER — v5.31 (unchanged)
 // =============================================================================
 
 async function handleCollect(request, env, ctx, url) {
@@ -661,7 +668,6 @@ async function handleCollect(request, env, ctx, url) {
     body.properties = {};
   }
 
-  // v5.30 FIX 4: normalize customerEmail → email
   if (body.properties?.customerEmail && !body.properties?.email) {
     body.properties.email = body.properties.customerEmail;
   }
@@ -742,7 +748,6 @@ async function handleCollect(request, env, ctx, url) {
   const collectOrderId   = resolveOrderId(body);
   const collectUserId    = resolveUserIdFromBody(body);
 
-  // Write attr:user + attr:order on OS_purchase
   if (env.GCLID_KV && !gpcOptOut && collectEventName === "OS_purchase" && attribution) {
     ctx.waitUntil(Promise.all([
       collectUserId
@@ -756,7 +761,6 @@ async function handleCollect(request, env, ctx, url) {
     ]));
   }
 
-  // Forward to Segment
   if (env.SEGMENT_WRITE_KEY) {
     ctx.waitUntil(
       forwardToSegment(env.SEGMENT_WRITE_KEY, body, anonId, superProps, attribution)
@@ -764,9 +768,6 @@ async function handleCollect(request, env, ctx, url) {
     );
   }
 
-  // v5.31: self-identify on ANY event where user_id present + not yet linked
-  // Handles apps that never call analytics.identify() explicitly
-  // KV idempotency guard ensures this fires exactly once per userId ever
   if (
     collectUserId &&
     anonId &&
@@ -777,7 +778,6 @@ async function handleCollect(request, env, ctx, url) {
     ctx.waitUntil(
       (async () => {
         try {
-          // Check KV first — skip if already linked (fires exactly once)
           const existingLink = await env.GCLID_KV.get(KV_IDLINK_PREFIX + collectUserId);
           if (existingLink) return;
 
@@ -813,7 +813,6 @@ async function handleCollect(request, env, ctx, url) {
     );
   }
 
-  // v5.30 FIX 1: set eden_anon_id cookie if missing
   const respHeaders = {
     "Content-Type": "application/json",
     ...corsHeadersObj(origin),
@@ -828,7 +827,7 @@ async function handleCollect(request, env, ctx, url) {
 
 
 // =============================================================================
-// /server-collect HANDLER — v5.30 (unchanged from v5.30)
+// /server-collect HANDLER — v5.30 (unchanged)
 // =============================================================================
 
 async function handleServerCollect(request, env, ctx) {
@@ -851,7 +850,6 @@ async function handleServerCollect(request, env, ctx) {
   const eventName = canonicalizeEventName(resolveEventName(body));
   const orderId   = resolveOrderId(body);
 
-  // Recover anonId from id:link KV when server doesn't provide it
   if (!anonId && userId && env.GCLID_KV) {
     try {
       const linkData = await env.GCLID_KV.get(KV_IDLINK_PREFIX + userId);
@@ -872,7 +870,6 @@ async function handleServerCollect(request, env, ctx) {
   if (anonId)    body.anonymousId = anonId;
   if (orderId && !body.properties.order_id) body.properties.order_id = orderId;
 
-  // Inject email_sha256 from KV on OS_purchase
   if (eventName === "OS_purchase" && userId && env.GCLID_KV && !body.properties.email_sha256) {
     try {
       const storedEmailHash = await env.GCLID_KV.get(KV_EMAIL_PREFIX + userId);
@@ -885,7 +882,6 @@ async function handleServerCollect(request, env, ctx) {
     }
   }
 
-  // Edge dedup
   if (CONVERSION_EVENTS.has(eventName) && orderId && env.GCLID_KV) {
     const dedupKey = `dedup:${eventName}:${orderId}`;
     try {
@@ -1059,7 +1055,6 @@ async function handleIdentify(request, env, ctx) {
     ]));
   }
 
-  // Store email_sha256 in KV for server-collect retrieval
   if (userId && env.GCLID_KV) {
     const emailRaw = resolveEmailFromBody(body)
       || rawTraits?.email
@@ -1292,6 +1287,14 @@ async function getAttribution(kv, key) {
   } catch { return null; }
 }
 
+// =============================================================================
+// resolveAttribution — v5.32
+// CHANGED: merge all KV sources instead of returning first match.
+// attr:anon (highest priority) wins all conflicts, ensuring the original
+// landing page gclid survives SSO/BNPL session breaks where only
+// attr:gcl:{_gcl_au} was written by preserve-attribution.
+// =============================================================================
+
 async function resolveAttribution(kv, anonId, userId, orderId = null, gclAu = null) {
   if (!kv) return null;
   const [fromAnon, fromUser, fromOrder, fromGcl] = await Promise.all([
@@ -1300,11 +1303,17 @@ async function resolveAttribution(kv, anonId, userId, orderId = null, gclAu = nu
     orderId ? getAttribution(kv, KV_ORDER_PREFIX  + orderId) : Promise.resolve(null),
     gclAu   ? getAttribution(kv, KV_GCL_PREFIX   + gclAu)   : Promise.resolve(null),
   ]);
-  if (fromAnon  && CLICK_ID_PARAMS.some(p => fromAnon[p]))  return fromAnon;
-  if (fromUser  && CLICK_ID_PARAMS.some(p => fromUser[p]))  return fromUser;
-  if (fromOrder && CLICK_ID_PARAMS.some(p => fromOrder[p])) return fromOrder;
-  if (fromGcl   && CLICK_ID_PARAMS.some(p => fromGcl[p]))   return fromGcl;
-  return fromAnon || fromUser || fromOrder || fromGcl || null;
+
+  // Merge all sources — lowest priority first, highest last.
+  // attr:anon has the original landing page gclid and wins all conflicts.
+  const merged = {
+    ...(fromGcl   || {}),   // cross-domain bridge — may only have _gcl_au
+    ...(fromOrder || {}),   // order-level preserve
+    ...(fromUser  || {}),   // user-level preserve
+    ...(fromAnon  || {}),   // original landing page — highest priority
+  };
+
+  return Object.keys(merged).length ? merged : null;
 }
 
 async function linkUserAttribution(kv, anonId, userId) {
