@@ -1,8 +1,8 @@
 // =============================================================================
-// EdenOS Analytics Worker — v5.37 GCLID RETENTION FIX
+// EdenOS Analytics Worker — v5.38 GCLID RETENTION FIX
 // =============================================================================
 //
-// v5.37 — GCLID/GBRAID/WBRAID retention hardening on top of v5.34.
+// v5.38 — GCLID/GBRAID/WBRAID retention + identity stitching hardening.
 //
 // ── FIXES ────────────────────────────────────────────────────────────────────
 //
@@ -36,6 +36,8 @@
 //            _gcl_au, improving recovery when anon/user/order links are missing.
 //  FIX 18 — Paid click/braid IDs win over organic referrer classification.
 //  FIX 19 — /server-collect dedup records attribution_found after resolution.
+//  FIX 20 — server/HealthOS userId no longer masquerades as anonymousId.
+//  FIX 21 — HealthOS-style patient/customer/member IDs resolved from nested payloads.
 //
 // ── ATTRIBUTION PRIORITY (highest → lowest) ──────────────────────────────────
 //   attr:anon:{anonId}   ← original landing page gclid       [KV, 120d]
@@ -67,7 +69,7 @@
 // CONSTANTS
 // ─────────────────────────────────────────────────────────────────────────────
 
-const PIPELINE_VERSION = "5.37";
+const PIPELINE_VERSION = "5.38";
 
 const ALLOWED_ORIGINS = [
   "https://eden.health",
@@ -524,9 +526,9 @@ export default {
           self_identify:                "fires on ANY event with user_id when id:link not yet in KV",
           email_kv:                     "email:user:{userId} → sha256 stored at identify time",
           order_id_sources:             "order_id | orderId | master_id | ecommerce.transaction_id | ecommerce.treatmentId",
-          resolve_attribution:          "v5.37 — anon > user > order > gcl > exact Google click bridge > cookie; click IDs retained for cookie window",
+          resolve_attribution:          "v5.38 — anon > user > order > gcl > exact Google click bridge > cookie; click IDs retained for cookie window",
           gpc_policy:                   "GPC marked on events; attribution retained unless RESPECT_GPC_ATTRIBUTION_OPTOUT=true",
-          fixes:                        "v5.37 — v5.34 hardening + GCLID retention/GPC/server-collect/iOS braid bridge/dedup fixes",
+          fixes:                        "v5.38 — v5.34 hardening + GCLID retention/GPC/server-collect/iOS braid bridge/dedup/identity stitching fixes",
           channels:                     CLICK_ID_CONFIG.map(c => c.label),
         });
       }
@@ -908,6 +910,7 @@ async function handleServerCollect(request, env, ctx) {
   const identity  = resolveIdentityFromBody(request, body);
   let   anonId    = identity.anonymousId || null;
   const userId    = identity.userId || null;
+  let   recoveredAnonFromUserLink = false;
   const eventName = canonicalizeEventName(resolveEventName(body));
   const orderId   = resolveOrderId(body);
   const serverGclAu = resolveGclAuFromBody(body);
@@ -920,7 +923,10 @@ async function handleServerCollect(request, env, ctx) {
       if (linkData) {
         const parsed = JSON.parse(linkData);
         anonId = parsed.anonId || null;
-        if (anonId) console.log(`[eden-analytics] server-collect: recovered anonId=${anonId} for userId=${userId}`);
+        if (anonId) {
+          recoveredAnonFromUserLink = true;
+          console.log(`[eden-analytics] server-collect: recovered anonId=${anonId} for userId=${userId}`);
+        }
       }
     } catch (err) {
       console.error("[eden-analytics] server-collect anonId recovery:", err);
@@ -1017,6 +1023,7 @@ async function handleServerCollect(request, env, ctx) {
     source_type:      "server",
     gpc_opt_out:      isGpcOptOut(request),
     pipeline_version: PIPELINE_VERSION,
+    recovered_anon_from_user_link: recoveredAnonFromUserLink,
     ...(identity.identityWarning ? { identity_warning: identity.identityWarning } : {}),
     ...(!anonId && !userId       ? { identity_warning: "no_identity_provided"   } : {}),
   };
@@ -1705,8 +1712,20 @@ function resolveOrderId(body) {
     body.properties?.ecommerce?.transaction_id ||
     body.properties?.ecommerce?.order_id       ||
     body.properties?.ecommerce?.treatmentId    ||
+    body.properties?.healthos?.order_id        ||
+    body.properties?.healthos?.orderId         ||
+    body.properties?.healthos?.master_id       ||
+    body.properties?.healthos?.masterId        ||
+    body.properties?.healthos?.treatment_id    ||
+    body.properties?.healthos?.treatmentId     ||
+    body.context?.traits?.order_id             ||
+    body.context?.traits?.orderId              ||
+    body.context?.traits?.master_id            ||
+    body.context?.traits?.masterId             ||
     body.order_id                              ||
     body.orderId                               ||
+    body.master_id                             ||
+    body.masterId                              ||
     null
   );
 }
@@ -1716,6 +1735,22 @@ function resolveUserIdFromBody(body) {
     body.properties?.userId||body.properties?.user_id||
     body.properties?.patient_id||body.properties?.customer_id||
     body.properties?.ecommerce?.userId||
+    body.properties?.healthos?.userId||
+    body.properties?.healthos?.user_id||
+    body.properties?.healthos?.patient_id||
+    body.properties?.healthos?.patientId||
+    body.properties?.healthos?.customer_id||
+    body.properties?.healthos?.member_id||
+    body.context?.traits?.userId||
+    body.context?.traits?.user_id||
+    body.context?.traits?.patient_id||
+    body.context?.traits?.patientId||
+    body.context?.traits?.customer_id||
+    body.context?.traits?.member_id||
+    body.patient_id||
+    body.patientId||
+    body.customer_id||
+    body.member_id||
     null;
 }
 
@@ -1773,8 +1808,10 @@ function resolveIdentityFromBody(request, body) {
     body.anonymousId||body.anonymous_id||body.anonymoous_id||
     body.anonymous_Id||body.anonymousid||
     body.properties?.anonymousId||body.properties?.anonymous_id||
-    body.properties?.anonymoous_id||null;
-  if (!anonymousId && userId) anonymousId = userId;
+    body.properties?.anonymoous_id||
+    body.context?.traits?.anonymousId||
+    body.context?.traits?.anonymous_id||
+    null;
   return {
     anonymousId, userId,
     identityWarning: anonymousId&&userId&&anonymousId===userId ? "anonymousId_equals_userId" : undefined,
