@@ -1,8 +1,8 @@
 // =============================================================================
-// EdenOS Analytics Worker — v5.38 GCLID RETENTION FIX
+// EdenOS Analytics Worker — v5.39 CANONICAL GCL_AU BRIDGE
 // =============================================================================
 //
-// v5.38 — GCLID/GBRAID/WBRAID retention + identity stitching hardening.
+// v5.39 — GCLID/GBRAID/WBRAID retention + identity stitching hardening.
 //
 // ── FIXES ────────────────────────────────────────────────────────────────────
 //
@@ -20,7 +20,7 @@
 //  FIX 6  — handleIdentify: body.orderId (DOM source) takes priority.
 //  FIX 7  — storeAttribution: no-click + no-click case enriches UTMs
 //            without overwriting stored_at.
-//  FIX 8  — buildAttrCookieValue: _gcl_hash and nbt excluded from cookie.
+//  FIX 8  — buildAttrCookieValue: _gcl_hash excluded from cookie.
 //  FIX 9  — extractPreAuthAttribution: _ts stored for defensive cookie age checks.
 //  FIX 10 — handleServerCollect: anonId recovery before dedup check.
 //  FIX 11 — segmentPost: network errors and non-2xx both logged + thrown.
@@ -38,6 +38,12 @@
 //  FIX 19 — /server-collect dedup records attribution_found after resolution.
 //  FIX 20 — server/HealthOS userId no longer masquerades as anonymousId.
 //  FIX 21 — HealthOS-style patient/customer/member IDs resolved from nested payloads.
+//  FIX 22 — Canonical _gcl_au bridge stores and resolves encoded, decoded, and
+//            Google cookie-style variants so _gl-only app landings can reconnect
+//            to original campaign attribution.
+//  FIX 23 — srsltid no longer classifies as paid_search without a stronger paid
+//            signal such as gclid/gbraid/wbraid/dclid/_gcl_au or CPC UTMs.
+//  FIX 24 — Google/Northbeam ad metadata retained in campaign context/cookie.
 //
 // ── ATTRIBUTION PRIORITY (highest → lowest) ──────────────────────────────────
 //   attr:anon:{anonId}   ← original landing page gclid       [KV, 120d]
@@ -69,7 +75,7 @@
 // CONSTANTS
 // ─────────────────────────────────────────────────────────────────────────────
 
-const PIPELINE_VERSION = "5.38";
+const PIPELINE_VERSION = "5.39";
 
 const ALLOWED_ORIGINS = [
   "https://eden.health",
@@ -99,6 +105,14 @@ const CLICK_ID_CONFIG = [
   { param: "click_id",  channel: "generic",           label: "Generic"             },
 ];
 const CLICK_ID_PARAMS = CLICK_ID_CONFIG.map(c => c.param);
+const PAID_SEARCH_CLICK_ID_PARAMS = ["gclid","gbraid","wbraid","dclid","_gcl_au","msclkid"];
+
+const GOOGLE_AD_PARAM_FIELDS = [
+  "gad_source","gad_campaignid","gidrep","creative","matchtype","network",
+  "device","targetid","feeditemid","placement",
+  "nb_adtype","nb_kwd","nb_ti","nb_mi","nb_pc","nb_pi","nb_ppi",
+  "nb_placement","nb_li_ms","nb_lp_ms","nb_fii","nb_ap","nb_mt",
+];
 
 const CONVERSION_EVENTS = new Set([
   "OS_qualified_first_order",
@@ -177,17 +191,18 @@ const ATTR_COOKIE_CLICK_ID_TTL = ATTR_COOKIE_TTL * 1000;
 
 // Fields stored in eden_attr.
 // Excluded: landing_page + attribution_referrer (URLs too long for cookie),
-//           _gcl_hash (internal derived field), nbt (not useful cross-subdomain).
+//           _gcl_hash (internal derived field).
 const ATTR_COOKIE_FIELDS = [
   "gclid","_gcl_au","gbraid","wbraid","dclid","srsltid",
   "fbclid","msclkid","ttclid","twclid","li_fat_id",
-  "rdt_cid","epik","ScCid","irclickid","cjevent","click_id",
+  "rdt_cid","epik","ScCid","nbt","irclickid","cjevent","click_id",
   "utm_source","utm_medium","utm_campaign","utm_content","utm_term","utm_id",
+  ...GOOGLE_AD_PARAM_FIELDS,
 ];
 
 const UTM_ENRICHABLE = [
   "utm_campaign","utm_content","utm_term","utm_id","attribution_campaign",
-  "landing_page","attribution_referrer",
+  "landing_page","attribution_referrer", ...GOOGLE_AD_PARAM_FIELDS,
 ];
 
 const ATTRIBUTION_TRAIT_KEYS = [
@@ -519,17 +534,17 @@ export default {
           segment_write_key_configured: !!env.SEGMENT_WRITE_KEY,
           server_secret_configured:     !!env.SERVER_API_SECRET,
           attribution_model:            "first-touch — 18 channels + UTM + referrer + landing_page",
-          coverage:                     "100% — all sources, all flows, all devices, all destinations",
-          cross_domain_bridge:          "attr:gcl:{_gcl_au} + attr:click:{gclid|gbraid|wbraid|dclid|srsltid}:{value}",
+          coverage:                     "target ~98% meaningful attribution with paid-click, _gcl_au, cookie, KV, order, and user bridges",
+          cross_domain_bridge:          "attr:gcl:{encoded|decoded|cookie-style _gcl_au} + attr:click:{gclid|gbraid|wbraid|dclid|srsltid}:{value}",
           first_party_cookie:           "eden_attr — 30d, click IDs + UTMs retained together",
           identify_flow:                "self-identify on first event with user_id + alias once + group",
           alias_guard:                  "permanent KV flag alias:fired:{userId}",
           self_identify:                "fires on ANY event with user_id when id:link not yet in KV",
           email_kv:                     "email:user:{userId} → sha256 stored at identify time",
           order_id_sources:             "order_id | orderId | master_id | ecommerce.transaction_id | ecommerce.treatmentId",
-          resolve_attribution:          "v5.38 — anon > user > order > gcl > exact Google click bridge > cookie; click IDs retained for cookie window",
+          resolve_attribution:          "v5.39 — anon > user > order > canonical gcl_au > exact Google click bridge > cookie; click IDs retained for cookie window",
           gpc_policy:                   "GPC marked on events; attribution retained unless RESPECT_GPC_ATTRIBUTION_OPTOUT=true",
-          fixes:                        "v5.38 — v5.34 hardening + GCLID retention/GPC/server-collect/iOS braid bridge/dedup/identity stitching fixes",
+          fixes:                        "v5.39 — canonical _gcl_au bridge + safer srsltid classification + v5.38 hardening",
           channels:                     CLICK_ID_CONFIG.map(c => c.label),
         });
       }
@@ -602,12 +617,7 @@ async function handlePageRequest(request, env, ctx, url) {
       storeAttribution(env.GCLID_KV, KV_ANON_PREFIX + anonId, fullAttribution)
         .catch(err => console.error("[eden-analytics] KV anon store error:", err)),
     ];
-    if (fullAttribution._gcl_au) {
-      writes.push(
-        storeAttribution(env.GCLID_KV, KV_GCL_PREFIX + fullAttribution._gcl_au, fullAttribution)
-          .catch(err => console.error("[eden-analytics] KV gcl store error:", err))
-      );
-    }
+    writes.push(...storeGclAuBridgeAttribution(env.GCLID_KV, fullAttribution));
     writes.push(...storeGoogleClickBridgeAttribution(env.GCLID_KV, fullAttribution));
     ctx.waitUntil(Promise.all(writes));
   }
@@ -814,8 +824,11 @@ async function handleCollect(request, env, ctx, url) {
   const collectOrderId   = resolveOrderId(body);
   const collectUserId    = resolveUserIdFromBody(body);
 
-  if (env.GCLID_KV && canUseAttribution && attribution && GOOGLE_CLICK_BRIDGE_PARAMS.some(p => attribution[p])) {
-    ctx.waitUntil(Promise.all(storeGoogleClickBridgeAttribution(env.GCLID_KV, attribution)));
+  if (env.GCLID_KV && canUseAttribution && attribution && (attribution._gcl_au || GOOGLE_CLICK_BRIDGE_PARAMS.some(p => attribution[p]))) {
+    ctx.waitUntil(Promise.all([
+      ...storeGclAuBridgeAttribution(env.GCLID_KV, attribution),
+      ...storeGoogleClickBridgeAttribution(env.GCLID_KV, attribution),
+    ]));
   }
 
   if (env.GCLID_KV && canUseAttribution && collectEventName === "OS_purchase" && attribution) {
@@ -828,6 +841,7 @@ async function handleCollect(request, env, ctx, url) {
         ? storeAttribution(env.GCLID_KV, KV_ORDER_PREFIX + collectOrderId, attribution)
             .catch(err => console.error("[eden-analytics] collect purchase order-link:", err))
         : Promise.resolve(),
+      ...storeGclAuBridgeAttribution(env.GCLID_KV, attribution),
       ...storeGoogleClickBridgeAttribution(env.GCLID_KV, attribution),
     ]));
   }
@@ -997,6 +1011,8 @@ async function handleServerCollect(request, env, ctx) {
       ctx.waitUntil(Promise.all([
         userId  ? storeAttribution(env.GCLID_KV, KV_USER_PREFIX  + userId,  storedAttribution).catch(console.error) : Promise.resolve(),
         orderId ? storeAttribution(env.GCLID_KV, KV_ORDER_PREFIX + orderId, storedAttribution).catch(console.error) : Promise.resolve(),
+        ...storeGclAuBridgeAttribution(env.GCLID_KV, storedAttribution),
+        ...storeGoogleClickBridgeAttribution(env.GCLID_KV, storedAttribution),
       ]));
     }
     if ((eventName === "OS_order_delivered" || eventName === "reorder_completed") && userId) {
@@ -1250,6 +1266,7 @@ async function handlePreserveAttribution(request, env, ctx) {
   const writes = [];
   if (orderId) writes.push(storeAttribution(env.GCLID_KV, KV_ORDER_PREFIX + orderId, attribution).catch(console.error));
   if (userId)  writes.push(storeAttribution(env.GCLID_KV, KV_USER_PREFIX  + userId,  attribution).catch(console.error));
+  writes.push(...storeGclAuBridgeAttribution(env.GCLID_KV, attribution));
   writes.push(...storeGoogleClickBridgeAttribution(env.GCLID_KV, attribution));
   if (writes.length) ctx.waitUntil(Promise.all(writes));
 
@@ -1472,6 +1489,68 @@ function googleClickBridgeKey(param, value) {
   return KV_CLICK_PREFIX + param + ":" + String(value);
 }
 
+function decodeGclAuMaybe(value) {
+  if (!value) return null;
+  const raw = String(value).trim();
+  try {
+    const b64 = raw.replace(/\./g,"=").replace(/-/g,"+").replace(/_/g,"/");
+    const decoded = atob(b64);
+    return /^\d+\.\d+$/.test(decoded) ? decoded : null;
+  } catch {
+    return null;
+  }
+}
+
+function gclAuVariants(value) {
+  if (!value) return [];
+  const variants = new Set();
+  const add = v => {
+    if (v && String(v).trim()) variants.add(String(v).trim());
+  };
+
+  const raw = String(value).trim();
+  add(raw);
+
+  const decoded = decodeGclAuMaybe(raw);
+  add(decoded);
+
+  for (const v of Array.from(variants)) {
+    const prefixed = v.match(/^1\.\d\.(\d+\.\d+)$/);
+    if (prefixed) add(prefixed[1]);
+    if (/^\d+\.\d+$/.test(v)) add(`1.1.${v}`);
+  }
+
+  return Array.from(variants);
+}
+
+function canonicalGclAu(value) {
+  const variants = gclAuVariants(value);
+  return variants.find(v => /^\d+\.\d+$/.test(v))
+      || variants.find(v => /^1\.\d\.\d+\.\d+$/.test(v))
+      || variants[0]
+      || null;
+}
+
+function storeGclAuBridgeAttribution(kv, attribution) {
+  if (!kv || !attribution?._gcl_au) return [];
+  const writes = [];
+  for (const value of gclAuVariants(attribution._gcl_au)) {
+    writes.push(
+      storeAttribution(kv, KV_GCL_PREFIX + value, attribution)
+        .catch(err => console.error("[eden-analytics] KV _gcl_au bridge store error:", err))
+    );
+  }
+  return writes;
+}
+
+async function getGclAuBridgeAttribution(kv, gclAu) {
+  if (!kv || !gclAu) return null;
+  const lookups = gclAuVariants(gclAu).map(v => getAttribution(kv, KV_GCL_PREFIX + v));
+  if (!lookups.length) return null;
+  const results = await Promise.all(lookups);
+  return results.find(Boolean) || null;
+}
+
 function storeGoogleClickBridgeAttribution(kv, attribution) {
   if (!kv || !attribution) return [];
   const writes = [];
@@ -1517,7 +1596,7 @@ async function resolveAttribution(
     anonId  ? getAttribution(kv, KV_ANON_PREFIX  + anonId)  : Promise.resolve(null),
     userId  ? getAttribution(kv, KV_USER_PREFIX   + userId)  : Promise.resolve(null),
     orderId ? getAttribution(kv, KV_ORDER_PREFIX  + orderId) : Promise.resolve(null),
-    gclAu   ? getAttribution(kv, KV_GCL_PREFIX   + gclAu)   : Promise.resolve(null),
+    gclAu   ? getGclAuBridgeAttribution(kv, gclAu)           : Promise.resolve(null),
     googleClickIds ? getGoogleClickBridgeAttribution(kv, googleClickIds) : Promise.resolve(null),
   ]);
 
@@ -1567,9 +1646,20 @@ function extractClickIds(url) {
     const v = url.searchParams.get(param);
     if (v) out[param] = v;
   }
+  Object.assign(out, extractGoogleAdParams(url));
   if (!out.gclid && !out._gcl_au) {
     const gl = url.searchParams.get("_gl");
     if (gl) Object.assign(out, extractGlLinker(gl));
+  }
+  if (out._gcl_au) out._gcl_au = canonicalGclAu(out._gcl_au) || out._gcl_au;
+  return out;
+}
+
+function extractGoogleAdParams(url) {
+  const out = {};
+  for (const k of GOOGLE_AD_PARAM_FIELDS) {
+    const v = url.searchParams.get(k);
+    if (v) out[k] = v;
   }
   return out;
 }
@@ -1582,7 +1672,7 @@ function extractGlLinker(gl) {
     for (let i = 2; i < parts.length - 1; i += 2) {
       const key = parts[i], value = parts[i + 1];
       if (key === "_gcl_au" && value) {
-        out._gcl_au = value;
+        out._gcl_au = canonicalGclAu(value) || value;
         try {
           const b64  = value.replace(/\./g,"=").replace(/-/g,"+").replace(/_/g,"/");
           const segs = atob(b64).split(".");
@@ -1615,7 +1705,7 @@ function buildCampaignContext(attribution) {
   const campaign = {};
   const KEYS = [
     "utm_source","utm_medium","utm_campaign","utm_content","utm_term","utm_id",
-    "landing_page","attribution_referrer", ...CLICK_ID_PARAMS,
+    "landing_page","attribution_referrer", ...CLICK_ID_PARAMS, ...GOOGLE_AD_PARAM_FIELDS,
   ];
   for (const k of KEYS) { if (attribution[k]) campaign[k] = attribution[k]; }
   return campaign;
@@ -1637,6 +1727,30 @@ function enrichPropertiesWithAttribution(properties, campaignProps) {
   properties.attribution_source   = properties.attribution_source   || campaignProps.utm_source || deriveClickIdSource(campaignProps);
   properties.attribution_medium   = properties.attribution_medium   || campaignProps.utm_medium;
   properties.attribution_campaign = properties.attribution_campaign || campaignProps.utm_campaign;
+  properties.attribution_confidence = properties.attribution_confidence || deriveAttributionConfidence(campaignProps);
+  const missingGclidReason = deriveMissingGclidReason(campaignProps);
+  if (missingGclidReason && !properties.missing_gclid_reason) {
+    properties.missing_gclid_reason = missingGclidReason;
+  }
+}
+
+function deriveAttributionConfidence(c) {
+  if (!c || !Object.keys(c).length) return "low";
+  if (c.gclid || c.gbraid || c.wbraid || c.dclid) return "high";
+  const med = String(c.utm_medium || "").toLowerCase();
+  if ((med === "cpc" || med === "search_cpc" || med === "paid_search" || med === "paid") &&
+      (c.utm_campaign || c._gcl_au || c.msclkid)) return "medium";
+  if (c._gcl_au || c.srsltid || c.attribution_referrer) return "medium";
+  return "low";
+}
+
+function deriveMissingGclidReason(c) {
+  if (!c || c.gclid) return undefined;
+  if (c.gbraid) return "gbraid_only";
+  if (c.wbraid) return "wbraid_only";
+  if (c._gcl_au) return "gcl_au_only";
+  if (c.srsltid) return "srsltid_only";
+  return undefined;
 }
 
 function deriveClickIdSource(c) {
@@ -1660,17 +1774,17 @@ function deriveAcquisitionChannel(c) {
   if (!c || !Object.keys(c).length) return "unknown";
   const src = String(c.utm_source || deriveClickIdSource(c) || "").toLowerCase();
   const med = String(c.utm_medium || "").toLowerCase();
-  if (c.gclid||c.gbraid||c.wbraid||c.dclid||c._gcl_au||c.srsltid||c.msclkid||
-      src.includes("google")||src.includes("bing")||src.includes("microsoft"))
-    return "paid_search";
   if (med === "organic")    return "organic_search";
   if (med === "email")      return "email";
   if (med === "sms")        return "sms";
   if (med === "affiliate")  return "affiliate";
   if (med === "influencer") return "influencer";
   if (med === "synthetic")  return "synthetic";
-  if (med === "cpc"||med === "paid"||med === "paid_search"||med === "search_cpc")
+  if (PAID_SEARCH_CLICK_ID_PARAMS.some(p => c[p]) ||
+      med === "cpc" || med === "paid" || med === "paid_search" ||
+      med === "search_cpc" || med === "ppc") {
     return "paid_search";
+  }
   if (c.fbclid||c.ttclid||src.includes("facebook")||src.includes("instagram")||
       src.includes("meta")||src.includes("tiktok"))
     return "paid_social";
@@ -1688,6 +1802,7 @@ function deriveAcquisitionChannel(c) {
       if (rh.includes("linkedin"))                                                 return "organic_social";
     } catch {}
   }
+  if (c.srsltid && src === "google") return "organic_search";
   return src || "direct";
 }
 
@@ -1767,7 +1882,7 @@ function resolveEmailFromBody(body) {
 }
 
 function resolveGclAuFromBody(body) {
-  return (
+  const value = (
     body.properties?._gcl_au              ||
     body.properties?.gcl_au               ||
     body.properties?.gclAu                ||
@@ -1781,6 +1896,7 @@ function resolveGclAuFromBody(body) {
     body.gcl_au                           ||
     null
   );
+  return canonicalGclAu(value) || value;
 }
 
 function resolveGoogleClickIdsFromBody(body) {
@@ -1972,7 +2088,7 @@ function clearCookie(name, url) {
   return [`${name}=`, "Max-Age=0", `Domain=${cookieDomain(url)}`, "Path=/", "Secure", "SameSite=Lax"].join("; ");
 }
 
-// FIX 8: _gcl_hash and nbt excluded. FIX 9: _ts staleness timestamp stored.
+// FIX 8: _gcl_hash excluded. FIX 9: _ts staleness timestamp stored.
 function buildAttrCookieValue(attribution) {
   const out = {};
   for (const k of ATTR_COOKIE_FIELDS) {
