@@ -1,8 +1,8 @@
 // =============================================================================
-// EdenOS Analytics Worker — v5.39 CANONICAL GCL_AU BRIDGE
+// EdenOS Analytics Worker — v5.40 ACQUISITION CHANNEL NORMALIZATION
 // =============================================================================
 //
-// v5.39 — GCLID/GBRAID/WBRAID retention + identity stitching hardening.
+// v5.40 — GCLID/GBRAID/WBRAID retention + identity stitching hardening.
 //
 // ── FIXES ────────────────────────────────────────────────────────────────────
 //
@@ -44,6 +44,9 @@
 //  FIX 23 — srsltid no longer classifies as paid_search without a stronger paid
 //            signal such as gclid/gbraid/wbraid/dclid/_gcl_au or CPC UTMs.
 //  FIX 24 — Google/Northbeam ad metadata retained in campaign context/cookie.
+//  FIX 25 — acquisition_channel is normalized in the worker for every
+//            server/client event. Invalid upstream values such as channel_main
+//            are replaced with the derived attribution channel.
 //
 // ── ATTRIBUTION PRIORITY (highest → lowest) ──────────────────────────────────
 //   attr:anon:{anonId}   ← original landing page gclid       [KV, 120d]
@@ -75,7 +78,7 @@
 // CONSTANTS
 // ─────────────────────────────────────────────────────────────────────────────
 
-const PIPELINE_VERSION = "5.39";
+const PIPELINE_VERSION = "5.40";
 
 const ALLOWED_ORIGINS = [
   "https://eden.health",
@@ -106,6 +109,36 @@ const CLICK_ID_CONFIG = [
 ];
 const CLICK_ID_PARAMS = CLICK_ID_CONFIG.map(c => c.param);
 const PAID_SEARCH_CLICK_ID_PARAMS = ["gclid","gbraid","wbraid","dclid","_gcl_au","msclkid"];
+
+const VALID_ACQUISITION_CHANNELS = new Set([
+  "paid_search",
+  "organic_search",
+  "direct",
+  "email",
+  "sms",
+  "affiliate",
+  "influencer",
+  "paid_social",
+  "organic_social",
+  "paid_social_linkedin",
+  "paid_social_reddit",
+  "paid_social_pinterest",
+  "paid_social_twitter",
+  "synthetic",
+  "unknown",
+]);
+
+const INVALID_ACQUISITION_CHANNELS = new Set([
+  "channel_main",
+  "main",
+  "default",
+  "codex_test",
+  "test",
+  "qa",
+  "chatgpt.com",
+  "null",
+  "undefined",
+]);
 
 const GOOGLE_AD_PARAM_FIELDS = [
   "gad_source","gad_campaignid","gidrep","creative","matchtype","network",
@@ -1142,7 +1175,7 @@ async function handleIdentify(request, env, ctx) {
     for (const k of ATTRIBUTION_TRAIT_KEYS) {
       if (!rawTraits[k] && storedAttribution[k]) attributionTraits[k] = storedAttribution[k];
     }
-    if (!rawTraits.acquisition_channel) attributionTraits.acquisition_channel = channel;
+    if (!cleanAcquisitionChannel(rawTraits.acquisition_channel)) attributionTraits.acquisition_channel = channel;
     if (!rawTraits.attribution_source)  attributionTraits.attribution_source  = source;
     if (!rawTraits.first_touch_at && storedAttribution.stored_at) {
       attributionTraits.first_touch_at = storedAttribution.stored_at;
@@ -1715,15 +1748,34 @@ function hasAnyClickId(attribution) {
   return !!(attribution && CLICK_ID_PARAMS.some(p => attribution[p]));
 }
 
+function cleanAcquisitionChannel(value) {
+  const channel = String(value || "").trim().toLowerCase();
+  if (!channel) return null;
+  if (INVALID_ACQUISITION_CHANNELS.has(channel)) return null;
+  if (!VALID_ACQUISITION_CHANNELS.has(channel)) return null;
+  return channel;
+}
+
 function enrichPropertiesWithAttribution(properties, campaignProps) {
   if (!properties || typeof properties !== "object") return;
-  if (!campaignProps || !Object.keys(campaignProps).length) return;
-  for (const [k, v] of Object.entries(campaignProps)) {
-    if (KV_INTERNAL_FIELDS.has(k)) continue;
-    if (v && !properties[k]) properties[k] = v;
+  const hasCampaignProps = !!(campaignProps && Object.keys(campaignProps).length);
+
+  if (hasCampaignProps) {
+    for (const [k, v] of Object.entries(campaignProps)) {
+      if (KV_INTERNAL_FIELDS.has(k)) continue;
+      if (v && !properties[k]) properties[k] = v;
+    }
+    if (campaignProps._gcl_au && !properties.gcl_au) properties.gcl_au = campaignProps._gcl_au;
   }
-  if (campaignProps._gcl_au && !properties.gcl_au) properties.gcl_au = campaignProps._gcl_au;
-  properties.acquisition_channel  = properties.acquisition_channel  || deriveAcquisitionChannel(campaignProps);
+
+  const derivedChannel = hasCampaignProps ? deriveAcquisitionChannel(campaignProps) : null;
+  const existingCleanChannel = cleanAcquisitionChannel(properties.acquisition_channel);
+  properties.acquisition_channel = derivedChannel && derivedChannel !== "unknown"
+    ? derivedChannel
+    : existingCleanChannel || "direct";
+
+  if (!hasCampaignProps) return;
+
   properties.attribution_source   = properties.attribution_source   || campaignProps.utm_source || deriveClickIdSource(campaignProps);
   properties.attribution_medium   = properties.attribution_medium   || campaignProps.utm_medium;
   properties.attribution_campaign = properties.attribution_campaign || campaignProps.utm_campaign;
@@ -1774,17 +1826,22 @@ function deriveAcquisitionChannel(c) {
   if (!c || !Object.keys(c).length) return "unknown";
   const src = String(c.utm_source || deriveClickIdSource(c) || "").toLowerCase();
   const med = String(c.utm_medium || "").toLowerCase();
+
+  const hasPaidSearchClickId = PAID_SEARCH_CLICK_ID_PARAMS.some(p => !!c[p]);
+
+  if (hasPaidSearchClickId ||
+      med === "cpc" || med === "paid" || med === "paid_search" ||
+      med === "search_cpc" || med === "ppc") {
+    return "paid_search";
+  }
+
   if (med === "organic")    return "organic_search";
   if (med === "email")      return "email";
   if (med === "sms")        return "sms";
   if (med === "affiliate")  return "affiliate";
   if (med === "influencer") return "influencer";
   if (med === "synthetic")  return "synthetic";
-  if (PAID_SEARCH_CLICK_ID_PARAMS.some(p => c[p]) ||
-      med === "cpc" || med === "paid" || med === "paid_search" ||
-      med === "search_cpc" || med === "ppc") {
-    return "paid_search";
-  }
+
   if (c.fbclid||c.ttclid||src.includes("facebook")||src.includes("instagram")||
       src.includes("meta")||src.includes("tiktok"))
     return "paid_social";
