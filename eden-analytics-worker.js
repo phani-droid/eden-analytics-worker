@@ -78,7 +78,7 @@
 // CONSTANTS
 // ─────────────────────────────────────────────────────────────────────────────
 
-const PIPELINE_VERSION = "5.40";
+const PIPELINE_VERSION = "5.41";
 
 const ALLOWED_ORIGINS = [
   "https://eden.health",
@@ -145,6 +145,13 @@ const GOOGLE_AD_PARAM_FIELDS = [
   "device","targetid","feeditemid","placement",
   "nb_adtype","nb_kwd","nb_ti","nb_mi","nb_pc","nb_pi","nb_ppi",
   "nb_placement","nb_li_ms","nb_lp_ms","nb_fii","nb_ap","nb_mt",
+];
+
+const PARTNER_PARAM_FIELDS = [
+  "upfluence_id","influencer_id","creator_id","partner_id","affiliate_id",
+  "referral_code","referral_id","ref","source","sub_id","subid","sub1",
+  "sub2","sub3","sub4","sub5","campaign_id","adgroup_id","ad_group_id",
+  "keyword","search_term",
 ];
 
 const CONVERSION_EVENTS = new Set([
@@ -231,6 +238,7 @@ const ATTR_COOKIE_FIELDS = [
   "rdt_cid","epik","ScCid","nbt","irclickid","cjevent","click_id",
   "utm_source","utm_medium","utm_campaign","utm_content","utm_term","utm_id",
   ...GOOGLE_AD_PARAM_FIELDS,
+  ...PARTNER_PARAM_FIELDS,
 ];
 
 const UTM_ENRICHABLE = [
@@ -1058,8 +1066,10 @@ async function handleServerCollect(request, env, ctx) {
 
   body.timestamp = nowUTC();
 
+  const propertyAttribution = buildCampaignContext(body.properties || {});
   const attribution   = {
     ...(storedAttribution ? stripInternalFields(storedAttribution) : {}),
+    ...propertyAttribution,
     ...((body.context || {}).campaign || {}),
   };
   const campaignProps = buildCampaignContext(attribution);
@@ -1738,7 +1748,10 @@ function buildCampaignContext(attribution) {
   const campaign = {};
   const KEYS = [
     "utm_source","utm_medium","utm_campaign","utm_content","utm_term","utm_id",
-    "landing_page","attribution_referrer", ...CLICK_ID_PARAMS, ...GOOGLE_AD_PARAM_FIELDS,
+    "landing_page","attribution_referrer",
+    ...CLICK_ID_PARAMS,
+    ...GOOGLE_AD_PARAM_FIELDS,
+    ...PARTNER_PARAM_FIELDS,
   ];
   for (const k of KEYS) { if (attribution[k]) campaign[k] = attribution[k]; }
   return campaign;
