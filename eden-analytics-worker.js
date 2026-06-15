@@ -84,7 +84,6 @@ const ALLOWED_ORIGINS = [
   "https://eden.health",
   "https://www.eden.health",
   "https://app.eden.health",
-  "http://localhost:7500",
 ];
 
 const CLICK_ID_CONFIG = [
