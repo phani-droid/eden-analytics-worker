@@ -84,6 +84,7 @@ const ALLOWED_ORIGINS = [
   "https://eden.health",
   "https://www.eden.health",
   "https://app.eden.health",
+  "https://health-os-patient-staging-65y4qvz0n-eden-health.vercel.app/",
 ];
 
 const CLICK_ID_CONFIG = [
