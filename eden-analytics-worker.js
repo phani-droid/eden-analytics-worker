@@ -1,8 +1,10 @@
 // =============================================================================
-// EdenOS Analytics Worker — v5.40 ACQUISITION CHANNEL NORMALIZATION
+// EdenOS Analytics Worker — v5.46 ROBUST COMPATIBLE ATTRIBUTION ENRICHMENT
 // =============================================================================
 //
-// v5.40 — GCLID/GBRAID/WBRAID retention + identity stitching hardening.
+// v5.46 — Adds non-breaking session fields plus first/last/current touch fields
+//          while preserving existing first_touch event volume, KV behavior, and
+//          pipeline_version value used by current BQ queries.
 //
 // ── FIXES ────────────────────────────────────────────────────────────────────
 //
@@ -47,6 +49,19 @@
 //  FIX 25 — acquisition_channel is normalized in the worker for every
 //            server/client event. Invalid upstream values such as channel_main
 //            are replaced with the derived attribution channel.
+//  FIX 26 — first_touch event remains session-scoped for BQ compatibility, with
+//            additive flags for true visitor-first-touch analysis.
+//  FIX 27 — client/server events receive additive first_touch_*, last_touch_*,
+//            and current_touch_* fields for BigQuery modeling without changing
+//            existing attribution fields or KV priority.
+//  FIX 28 — client/server events receive additive session_* fields derived from
+//            eden_session_id or supplied payload fields.
+//  FIX 29 — pipeline_version remains 5.41 for BQ compatibility; new model
+//            changes are marked with enrichment_version instead.
+//  FIX 30 — /collect creates eden_session_id when collector is the first touch,
+//            appending cookies safely without dropping eden_anon_id.
+//  FIX 31 — touch/source metadata marks whether first touch came from durable
+//            attribution memory or from the current event as a fallback.
 //
 // ── ATTRIBUTION PRIORITY (highest → lowest) ──────────────────────────────────
 //   attr:anon:{anonId}   ← original landing page gclid       [KV, 120d]
@@ -79,6 +94,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 const PIPELINE_VERSION = "5.41";
+const ENRICHMENT_VERSION = "5.46";
 
 const ALLOWED_ORIGINS = [
   "https://eden.health",
@@ -570,6 +586,7 @@ export default {
           ok:                           true,
           worker:                       "eden-analytics",
           version:                      PIPELINE_VERSION,
+          enrichment_version:           ENRICHMENT_VERSION,
           ts:                           nowUTC(),
           kv:                           !!env.GCLID_KV,
           segment_write_key_configured: !!env.SEGMENT_WRITE_KEY,
@@ -684,7 +701,7 @@ async function handlePageRequest(request, env, ctx, url) {
 
   if (env.SEGMENT_WRITE_KEY && isNewSession && hasAttribution && canUseAttribution) {
     ctx.waitUntil(
-      fireFirstTouch(request, env, anonId, session, url, mergedClickIds, utms, referrer)
+      fireFirstTouch(request, env, anonId, session, url, mergedClickIds, utms, referrer, isNewVisitor, isNewSession)
         .catch(err => console.error("[eden-analytics] first_touch error:", err))
     );
   }
@@ -720,7 +737,7 @@ async function handlePageRequest(request, env, ctx, url) {
 // FIRST TOUCH EVENT
 // =============================================================================
 
-async function fireFirstTouch(request, env, anonId, session, url, clickIds, utms, referrer) {
+async function fireFirstTouch(request, env, anonId, session, url, clickIds, utms, referrer, isNewVisitor = false, isNewSession = true) {
   const cleanUrl  = sanitizeUrl(url).toString();
   const ua        = request.headers.get("User-Agent") || "";
   const portal    = url.hostname.includes("app.eden.health") ? "patient" : "marketing";
@@ -744,6 +761,11 @@ async function fireFirstTouch(request, env, anonId, session, url, clickIds, utms
       landing_page:         cleanUrl,
       referrer:             referrer || undefined,
       session_id:           sessionId,
+      session_key:          sessionId,
+      first_touch_scope:    isNewVisitor ? "visitor" : "session",
+      is_true_first_touch:  !!isNewVisitor,
+      is_new_visitor:       !!isNewVisitor,
+      is_new_session:       !!isNewSession,
       device_type:          isMobile(ua) ? "mobile" : "desktop",
       pipeline_version:     PIPELINE_VERSION,
       ...privacyProperties(request),
@@ -799,6 +821,13 @@ async function handleCollect(request, env, ctx, url) {
   const isNew  = !cookieAnonId;
   const portal = origin.includes("app.eden.health") ? "patient" : "marketing";
   const userId = resolveUserIdFromBody(body);
+  const existingSessionCookie = readCookie(request, "eden_session_id");
+  let session = resolveSessionFromRequestBody(request, body, "client");
+  let generatedSessionRaw = null;
+  if (!session) {
+    generatedSessionRaw = `${crypto.randomUUID()}_${Date.now()}`;
+    session = buildSessionContext(generatedSessionRaw, "generated_collect_session", "client", body);
+  }
 
   if (body.type === "identify" && userId && anonId && anonId !== userId && env.GCLID_KV && canUseAttribution) {
     ctx.waitUntil(
@@ -836,6 +865,11 @@ async function handleCollect(request, env, ctx, url) {
     : cookieAttr ? stripInternalFields(cookieAttr) : null;
 
   const contextCampaign = canUseAttribution ? ((body.context || {}).campaign || {}) : {};
+  const currentAttribution = {
+    ...freshClickIds,
+    ...(freshUTMs || {}),
+    ...(pageReferrer ? { attribution_referrer: pageReferrer } : {}),
+  };
 
   // Merge priority: storedKV(+cookie inside) < contextCampaign < freshClickIds < freshUTMs
   const attribution = {
@@ -849,6 +883,13 @@ async function handleCollect(request, env, ctx, url) {
 
   const campaignProps = buildCampaignContext(attribution);
   enrichPropertiesWithAttribution(body.properties, campaignProps);
+  enrichPropertiesWithTouchModel(
+    body.properties,
+    storedAttribution || attribution,
+    Object.keys(currentAttribution).length ? currentAttribution : null,
+    storedAttribution ? "stored_attribution" : "current_event_fallback"
+  );
+  enrichPropertiesWithSession(body.properties, session);
 
   if (!body.context) body.context = {};
   body.context.campaign = { ...((body.context || {}).campaign || {}), ...campaignProps };
@@ -859,6 +900,8 @@ async function handleCollect(request, env, ctx, url) {
     gpc_opt_out:      gpcOptOut,
     attribution_suppressed: !canUseAttribution,
     pipeline_version: PIPELINE_VERSION,
+    enrichment_version: ENRICHMENT_VERSION,
+    ...sessionSuperProps(session),
   };
 
   const collectEventName = canonicalizeEventName(resolveEventName(body));
@@ -935,10 +978,15 @@ async function handleCollect(request, env, ctx, url) {
     );
   }
 
-  const respHeaders = { "Content-Type": "application/json", ...corsHeadersObj(origin) };
+  const respHeaders = new Headers({ "Content-Type": "application/json", ...corsHeadersObj(origin) });
+  const reqUrl = new URL(request.url);
   if (isNew) {
-    respHeaders["Set-Cookie"] = buildAnonCookie(anonId, new URL(request.url));
+    respHeaders.append("Set-Cookie", buildAnonCookie(anonId, reqUrl));
     console.log(`[eden-analytics] collect: set eden_anon_id for new visitor ${anonId}`);
+  }
+  if (!existingSessionCookie && generatedSessionRaw) {
+    respHeaders.append("Set-Cookie", buildSessionCookie(generatedSessionRaw, reqUrl));
+    console.log("[eden-analytics] collect: set eden_session_id for collector-first session");
   }
 
   return new Response(JSON.stringify({ ok: true, anonId }), { status: 200, headers: respHeaders });
@@ -971,6 +1019,7 @@ async function handleServerCollect(request, env, ctx) {
   const orderId   = resolveOrderId(body);
   const serverGclAu = resolveGclAuFromBody(body);
   const serverGoogleClickIds = resolveGoogleClickIdsFromBody(body);
+  const session = resolveSessionFromRequestBody(request, body, "server");
 
   // FIX 10: anonId recovery BEFORE dedup check
   if (!anonId && userId && env.GCLID_KV) {
@@ -1013,6 +1062,12 @@ async function handleServerCollect(request, env, ctx) {
   const storedAttribution = env.GCLID_KV
     ? await resolveAttribution(env.GCLID_KV, anonId, userId, orderId, serverGclAu, null, serverGoogleClickIds)
     : null;
+  const serverCurrentAttribution = {
+    ...buildCampaignContext(body.properties || {}),
+    ...((body.context || {}).campaign || {}),
+    ...(serverGclAu ? { _gcl_au: serverGclAu } : {}),
+    ...(serverGoogleClickIds || {}),
+  };
 
   // Dedup check — after attribution resolution, so the dedup record can tell
   // whether the first accepted conversion had recoverable attribution.
@@ -1074,6 +1129,13 @@ async function handleServerCollect(request, env, ctx) {
   };
   const campaignProps = buildCampaignContext(attribution);
   enrichPropertiesWithAttribution(body.properties, campaignProps);
+  enrichPropertiesWithTouchModel(
+    body.properties,
+    storedAttribution || attribution,
+    Object.keys(serverCurrentAttribution).length ? serverCurrentAttribution : null,
+    storedAttribution ? "stored_attribution" : "current_event_fallback"
+  );
+  enrichPropertiesWithSession(body.properties, session);
 
   if (!body.context) body.context = {};
   body.context.campaign = { ...((body.context || {}).campaign || {}), ...campaignProps };
@@ -1083,7 +1145,9 @@ async function handleServerCollect(request, env, ctx) {
     source_type:      "server",
     gpc_opt_out:      isGpcOptOut(request),
     pipeline_version: PIPELINE_VERSION,
+    enrichment_version: ENRICHMENT_VERSION,
     recovered_anon_from_user_link: recoveredAnonFromUserLink,
+    ...sessionSuperProps(session),
     ...(identity.identityWarning ? { identity_warning: identity.identityWarning } : {}),
     ...(!anonId && !userId       ? { identity_warning: "no_identity_provided"   } : {}),
   };
@@ -1797,6 +1861,181 @@ function enrichPropertiesWithAttribution(properties, campaignProps) {
   if (missingGclidReason && !properties.missing_gclid_reason) {
     properties.missing_gclid_reason = missingGclidReason;
   }
+}
+
+function buildTouchSnapshot(attribution) {
+  if (!attribution || !Object.keys(attribution).length) return null;
+  const campaignProps = buildCampaignContext(attribution);
+  if (!Object.keys(campaignProps).length) return null;
+
+  return {
+    source:       campaignProps.utm_source || deriveClickIdSource(campaignProps),
+    medium:       campaignProps.utm_medium,
+    campaign:     campaignProps.utm_campaign,
+    content:      campaignProps.utm_content,
+    term:         campaignProps.utm_term,
+    channel:      deriveAcquisitionChannel(campaignProps),
+    gclid:        campaignProps.gclid,
+    gbraid:       campaignProps.gbraid,
+    wbraid:       campaignProps.wbraid,
+    dclid:        campaignProps.dclid,
+    gcl_au:       campaignProps._gcl_au,
+    msclkid:      campaignProps.msclkid,
+    fbclid:       campaignProps.fbclid,
+    landing_page: campaignProps.landing_page,
+    referrer:     campaignProps.attribution_referrer,
+    confidence:   deriveAttributionConfidence(campaignProps),
+    captured_at:  nowUTC(),
+  };
+}
+
+function setTouchProperty(properties, key, value) {
+  if (value === undefined || value === null || value === "") return;
+  if (properties[key] === undefined || properties[key] === null || properties[key] === "") {
+    properties[key] = value;
+  }
+}
+
+function writeTouchSnapshot(properties, prefix, touch, capturedAt) {
+  if (!touch) return;
+  setTouchProperty(properties, `${prefix}_source`,       touch.source);
+  setTouchProperty(properties, `${prefix}_medium`,       touch.medium);
+  setTouchProperty(properties, `${prefix}_campaign`,     touch.campaign);
+  setTouchProperty(properties, `${prefix}_content`,      touch.content);
+  setTouchProperty(properties, `${prefix}_term`,         touch.term);
+  setTouchProperty(properties, `${prefix}_channel`,      touch.channel);
+  setTouchProperty(properties, `${prefix}_gclid`,        touch.gclid);
+  setTouchProperty(properties, `${prefix}_gbraid`,       touch.gbraid);
+  setTouchProperty(properties, `${prefix}_wbraid`,       touch.wbraid);
+  setTouchProperty(properties, `${prefix}_dclid`,        touch.dclid);
+  setTouchProperty(properties, `${prefix}_gcl_au`,       touch.gcl_au);
+  setTouchProperty(properties, `${prefix}_msclkid`,      touch.msclkid);
+  setTouchProperty(properties, `${prefix}_fbclid`,       touch.fbclid);
+  setTouchProperty(properties, `${prefix}_landing_page`, touch.landing_page);
+  setTouchProperty(properties, `${prefix}_referrer`,     touch.referrer);
+  setTouchProperty(properties, `${prefix}_confidence`,   touch.confidence);
+  setTouchProperty(properties, `${prefix}_at`,           capturedAt || touch.captured_at);
+}
+
+function enrichPropertiesWithTouchModel(properties, firstAttribution, currentAttribution, firstTouchSource = "stored_attribution") {
+  if (!properties || typeof properties !== "object") return;
+
+  const first = buildTouchSnapshot(firstAttribution);
+  const current = buildTouchSnapshot(currentAttribution);
+
+  if (first) {
+    writeTouchSnapshot(properties, "first_touch", first, firstAttribution?.stored_at || first.captured_at);
+    setTouchProperty(properties, "first_touch_source_type", firstTouchSource);
+    setTouchProperty(properties, "first_touch_from_memory", firstTouchSource === "stored_attribution");
+  }
+
+  if (current) {
+    writeTouchSnapshot(properties, "current_touch", current, current.captured_at);
+    writeTouchSnapshot(properties, "last_touch", current, current.captured_at);
+    setTouchProperty(properties, "last_touch_source_type", "current_event");
+  }
+
+  if (first || current) {
+    setTouchProperty(properties, "attribution_model", "first_touch_primary_last_touch_snapshot");
+    setTouchProperty(properties, "touch_model_version", ENRICHMENT_VERSION);
+  }
+}
+
+function firstValue(...values) {
+  for (const value of values) {
+    if (value !== undefined && value !== null && String(value).trim() !== "") return value;
+  }
+  return null;
+}
+
+function parseSessionValue(value) {
+  const raw = firstValue(value);
+  if (!raw) return null;
+
+  const str = String(raw).trim();
+  const parts = str.split("_");
+  const maybeStartedMs = Number(parts[parts.length - 1]);
+  const hasStartedMs = Number.isFinite(maybeStartedMs) && maybeStartedMs > 1000000000000;
+  const stableId = hasStartedMs ? parts.slice(0, -1).join("_") : str;
+  const startedAt = hasStartedMs ? new Date(maybeStartedMs).toISOString() : null;
+  const ageSeconds = hasStartedMs ? Math.max(0, Math.floor((Date.now() - maybeStartedMs) / 1000)) : null;
+
+  return {
+    raw,
+    id: stableId || str,
+    started_at: startedAt,
+    age_seconds: ageSeconds,
+  };
+}
+
+function buildSessionContext(rawSession, source, sourceType, body) {
+  const parsed = parseSessionValue(rawSession);
+  if (!parsed) return null;
+  const props = body?.properties || {};
+  const page = body?.context?.page || {};
+
+  return {
+    ...parsed,
+    source,
+    source_type: sourceType,
+    timeout_minutes: 30,
+    page_path: page.path || props.page_path || null,
+    page_url: page.url || props.page_url || null,
+  };
+}
+
+function resolveSessionFromRequestBody(request, body, sourceType) {
+  const props = body?.properties || {};
+  const context = body?.context || {};
+  const traits = context.traits || {};
+  const cookieSession = readCookie(request, "eden_session_id");
+  const suppliedSession = firstValue(
+    cookieSession,
+    body?.session_id,
+    body?.sessionId,
+    body?.session_id_raw,
+    props.session_id,
+    props.sessionId,
+    props.eden_session_id,
+    props.session_id_raw,
+    context.session_id,
+    context.sessionId,
+    traits.session_id,
+    traits.sessionId
+  );
+
+  const source = cookieSession ? "eden_session_cookie" : "payload";
+  return buildSessionContext(suppliedSession, source, sourceType, body);
+}
+
+function enrichPropertiesWithSession(properties, session) {
+  if (!properties || typeof properties !== "object" || !session) return;
+
+  setTouchProperty(properties, "session_id", session.raw || session.id);
+  setTouchProperty(properties, "eden_session_id", session.raw || session.id);
+  setTouchProperty(properties, "session_key", session.id);
+  setTouchProperty(properties, "session_id_raw", session.raw);
+  setTouchProperty(properties, "session_started_at", session.started_at);
+  setTouchProperty(properties, "session_age_seconds", session.age_seconds);
+  setTouchProperty(properties, "session_timeout_minutes", session.timeout_minutes);
+  setTouchProperty(properties, "session_source", session.source);
+  setTouchProperty(properties, "session_source_type", session.source_type);
+  setTouchProperty(properties, "session_page_path", session.page_path);
+  setTouchProperty(properties, "session_page_url", session.page_url);
+  setTouchProperty(properties, "session_model_version", ENRICHMENT_VERSION);
+}
+
+function sessionSuperProps(session) {
+  if (!session) return {};
+  return {
+    session_key: session.id,
+    ...(session.raw ? { session_id_raw: session.raw } : {}),
+    ...(session.started_at ? { session_started_at: session.started_at } : {}),
+    ...(session.age_seconds !== null ? { session_age_seconds: session.age_seconds } : {}),
+    session_timeout_minutes: session.timeout_minutes,
+    session_source: session.source,
+    session_model_version: ENRICHMENT_VERSION,
+  };
 }
 
 function deriveAttributionConfidence(c) {
