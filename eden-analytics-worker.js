@@ -101,7 +101,8 @@ const ALLOWED_ORIGINS = [
   "https://www.eden.health",
   "https://app.eden.health",
   "https://health-os-patient-staging-65y4qvz0n-eden-health.vercel.app/in/intake/weightloss/",
-  "https://health-os-patient-staging-72z0k5qsc-eden-health.vercel.app"
+  "https://health-os-patient-staging-72z0k5qsc-eden-health.vercel.app",
+  "https://health-os-patient-staging-420mkgl3w-eden-health.vercel.app",
 ];
 
 const CLICK_ID_CONFIG = [
