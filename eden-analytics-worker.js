@@ -62,6 +62,11 @@
 //            appending cookies safely without dropping eden_anon_id.
 //  FIX 31 — touch/source metadata marks whether first touch came from durable
 //            attribution memory or from the current event as a fallback.
+//  FIX 32 — master_user_id is now the only trusted known-user identity coming
+//            from event properties/traits. customer_id, patient_id, email, and
+//            customerio_id remain metadata and are no longer promoted to userId.
+//  FIX 33 — email_sha256 attribution bridge added for deterministic
+//            cross-browser recovery when anonymous cookies are unavailable.
 //
 // ── ATTRIBUTION PRIORITY (highest → lowest) ──────────────────────────────────
 //   attr:anon:{anonId}   ← original landing page gclid       [KV, 120d]
@@ -82,6 +87,7 @@
 //   attr:order:{orderId}     → attribution (120d)
 //   attr:gcl:{_gcl_au}       → cross-domain bridge (120d)
 //   attr:click:{param}:{id}  → exact Google click/braid bridge (120d)
+//   attr:email:{email_sha256} → deterministic email attribution bridge (120d)
 //   email:user:{userId}      → email_sha256 (120d)
 //   id:link:{userId}         → {anonId, ts} (30d)
 //   alias:fired:{userId}     → permanent alias guard (10yr)
@@ -111,6 +117,7 @@ const CLICK_ID_CONFIG = [
   { param: "gbraid",    channel: "google_ios",       label: "Google iOS"          },
   { param: "wbraid",    channel: "google_web",       label: "Google Web"          },
   { param: "dclid",     channel: "google_display",   label: "Google Display"      },
+  { param: "gclsrc",    channel: "google_ads",       label: "Google Click Source" },
   { param: "_gcl_au",   channel: "google_ads",       label: "Google Cross-Domain" },
   { param: "srsltid",   channel: "google_shopping",  label: "Google Shopping"     },
   { param: "fbclid",    channel: "meta",              label: "Meta/Facebook"       },
@@ -127,7 +134,7 @@ const CLICK_ID_CONFIG = [
   { param: "click_id",  channel: "generic",           label: "Generic"             },
 ];
 const CLICK_ID_PARAMS = CLICK_ID_CONFIG.map(c => c.param);
-const PAID_SEARCH_CLICK_ID_PARAMS = ["gclid","gbraid","wbraid","dclid","_gcl_au","msclkid"];
+const PAID_SEARCH_CLICK_ID_PARAMS = ["gclid","gbraid","wbraid","dclid","gclsrc","_gcl_au","msclkid"];
 
 const VALID_ACQUISITION_CHANNELS = new Set([
   "paid_search",
@@ -160,7 +167,9 @@ const INVALID_ACQUISITION_CHANNELS = new Set([
 ]);
 
 const GOOGLE_AD_PARAM_FIELDS = [
-  "gad_source","gad_campaignid","gidrep","creative","matchtype","network",
+  "gad_source","gad_campaignid","gad_adgroupid","gad_id","gad_creativeid",
+  "gad_matchtype","gad_network","gad_device","gad_keyword","gad_placement",
+  "gad_targetid","gidrep","creative","matchtype","network",
   "device","targetid","feeditemid","placement",
   "nb_adtype","nb_kwd","nb_ti","nb_mi","nb_pc","nb_pi","nb_ppi",
   "nb_placement","nb_li_ms","nb_lp_ms","nb_fii","nb_ap","nb_mt",
@@ -233,6 +242,7 @@ const KV_USER_PREFIX   = "attr:user:";
 const KV_ORDER_PREFIX  = "attr:order:";
 const KV_GCL_PREFIX    = "attr:gcl:";
 const KV_CLICK_PREFIX  = "attr:click:";
+const KV_EMAIL_ATTR_PREFIX = "attr:email:";
 const KV_EMAIL_PREFIX  = "email:user:";
 const KV_IDLINK_PREFIX = "id:link:";
 const KV_ALIAS_PREFIX  = "alias:fired:";
@@ -598,7 +608,7 @@ export default {
           coverage:                     "target ~98% meaningful attribution with paid-click, _gcl_au, cookie, KV, order, and user bridges",
           cross_domain_bridge:          "attr:gcl:{encoded|decoded|cookie-style _gcl_au} + attr:click:{gclid|gbraid|wbraid|dclid|srsltid}:{value}",
           first_party_cookie:           "eden_attr — 30d, click IDs + UTMs retained together",
-          identify_flow:                "self-identify on first event with user_id + alias once + group",
+          identify_flow:                "self-identify on first event with master_user_id + alias once + group",
           alias_guard:                  "permanent KV flag alias:fired:{userId}",
           self_identify:                "fires on ANY event with user_id when id:link not yet in KV",
           email_kv:                     "email:user:{userId} → sha256 stored at identify time",
@@ -824,6 +834,7 @@ async function handleCollect(request, env, ctx, url) {
   const isNew  = !cookieAnonId;
   const portal = origin.includes("app.eden.health") ? "patient" : "marketing";
   const userId = resolveUserIdFromBody(body);
+  const emailHash = await resolveEmailHashFromBody(body);
   const existingSessionCookie = readCookie(request, "eden_session_id");
   let session = resolveSessionFromRequestBody(request, body, "client");
   let generatedSessionRaw = null;
@@ -864,7 +875,7 @@ async function handleCollect(request, env, ctx, url) {
   const cookieAttr = canUseAttribution ? extractPreAuthAttribution(request) : null;
 
   const storedAttribution = (env.GCLID_KV && canUseAttribution)
-    ? await resolveAttribution(env.GCLID_KV, anonId, userId, resolveOrderId(body), freshGclAu, cookieAttr)
+    ? await resolveAttribution(env.GCLID_KV, anonId, userId, resolveOrderId(body), freshGclAu, cookieAttr, null, emailHash)
     : cookieAttr ? stripInternalFields(cookieAttr) : null;
 
   const contextCampaign = canUseAttribution ? ((body.context || {}).campaign || {}) : {};
@@ -904,18 +915,28 @@ async function handleCollect(request, env, ctx, url) {
     attribution_suppressed: !canUseAttribution,
     pipeline_version: PIPELINE_VERSION,
     enrichment_version: ENRICHMENT_VERSION,
+    ...requestContextProperties(request, body),
     ...sessionSuperProps(session),
   };
 
   const collectEventName = canonicalizeEventName(resolveEventName(body));
   const collectOrderId   = resolveOrderId(body);
   const collectUserId    = resolveUserIdFromBody(body);
+  const identitySafetyProps = buildIdentitySafetyProperties(body, anonId, collectUserId);
+  Object.assign(superProps, identitySafetyProps);
 
   if (env.GCLID_KV && canUseAttribution && attribution && (attribution._gcl_au || GOOGLE_CLICK_BRIDGE_PARAMS.some(p => attribution[p]))) {
     ctx.waitUntil(Promise.all([
       ...storeGclAuBridgeAttribution(env.GCLID_KV, attribution),
       ...storeGoogleClickBridgeAttribution(env.GCLID_KV, attribution),
     ]));
+  }
+
+  if (env.GCLID_KV && canUseAttribution && attribution && emailHash) {
+    ctx.waitUntil(
+      storeAttribution(env.GCLID_KV, KV_EMAIL_ATTR_PREFIX + emailHash, attribution)
+        .catch(err => console.error("[eden-analytics] collect email attribution bridge:", err))
+    );
   }
 
   if (env.GCLID_KV && canUseAttribution && collectEventName === "OS_purchase" && attribution) {
@@ -927,6 +948,10 @@ async function handleCollect(request, env, ctx, url) {
       collectOrderId
         ? storeAttribution(env.GCLID_KV, KV_ORDER_PREFIX + collectOrderId, attribution)
             .catch(err => console.error("[eden-analytics] collect purchase order-link:", err))
+        : Promise.resolve(),
+      emailHash
+        ? storeAttribution(env.GCLID_KV, KV_EMAIL_ATTR_PREFIX + emailHash, attribution)
+            .catch(err => console.error("[eden-analytics] collect purchase email-link:", err))
         : Promise.resolve(),
       ...storeGclAuBridgeAttribution(env.GCLID_KV, attribution),
       ...storeGoogleClickBridgeAttribution(env.GCLID_KV, attribution),
@@ -940,7 +965,7 @@ async function handleCollect(request, env, ctx, url) {
     );
   }
 
-  // Self-identify: fires when we see a userId we haven't linked yet.
+  // Self-identify: fires only when we see a trusted master userId we haven't linked yet.
   // FIX 3: full Cookie header forwarded so /identify also gets eden_attr.
   if (collectUserId && anonId && collectUserId !== anonId && env.GCLID_KV && canUseAttribution) {
     ctx.waitUntil(
@@ -1022,6 +1047,7 @@ async function handleServerCollect(request, env, ctx) {
   const orderId   = resolveOrderId(body);
   const serverGclAu = resolveGclAuFromBody(body);
   const serverGoogleClickIds = resolveGoogleClickIdsFromBody(body);
+  const emailHash = await resolveEmailHashFromBody(body);
   const session = resolveSessionFromRequestBody(request, body, "server");
 
   // FIX 10: anonId recovery BEFORE dedup check
@@ -1063,7 +1089,7 @@ async function handleServerCollect(request, env, ctx) {
   // Server-collect has no browser cookie context. If the app/backend supplies
   // _gcl_au/gcl_au, use it as an additional cross-domain lookup key.
   const storedAttribution = env.GCLID_KV
-    ? await resolveAttribution(env.GCLID_KV, anonId, userId, orderId, serverGclAu, null, serverGoogleClickIds)
+    ? await resolveAttribution(env.GCLID_KV, anonId, userId, orderId, serverGclAu, null, serverGoogleClickIds, emailHash)
     : null;
   const serverCurrentAttribution = {
     ...buildCampaignContext(body.properties || {}),
@@ -1071,6 +1097,12 @@ async function handleServerCollect(request, env, ctx) {
     ...(serverGclAu ? { _gcl_au: serverGclAu } : {}),
     ...(serverGoogleClickIds || {}),
   };
+  const identitySafetyProps = buildIdentitySafetyProperties(body, anonId, userId);
+  const identityWarnings = [
+    identitySafetyProps.identity_warning,
+    identity.identityWarning,
+    !anonId && !userId ? "no_identity_provided" : null,
+  ].filter(Boolean);
 
   // Dedup check — after attribution resolution, so the dedup record can tell
   // whether the first accepted conversion had recoverable attribution.
@@ -1110,6 +1142,7 @@ async function handleServerCollect(request, env, ctx) {
       ctx.waitUntil(Promise.all([
         userId  ? storeAttribution(env.GCLID_KV, KV_USER_PREFIX  + userId,  storedAttribution).catch(console.error) : Promise.resolve(),
         orderId ? storeAttribution(env.GCLID_KV, KV_ORDER_PREFIX + orderId, storedAttribution).catch(console.error) : Promise.resolve(),
+        emailHash ? storeAttribution(env.GCLID_KV, KV_EMAIL_ATTR_PREFIX + emailHash, storedAttribution).catch(console.error) : Promise.resolve(),
         ...storeGclAuBridgeAttribution(env.GCLID_KV, storedAttribution),
         ...storeGoogleClickBridgeAttribution(env.GCLID_KV, storedAttribution),
       ]));
@@ -1150,9 +1183,10 @@ async function handleServerCollect(request, env, ctx) {
     pipeline_version: PIPELINE_VERSION,
     enrichment_version: ENRICHMENT_VERSION,
     recovered_anon_from_user_link: recoveredAnonFromUserLink,
+    ...requestContextProperties(request, body),
     ...sessionSuperProps(session),
-    ...(identity.identityWarning ? { identity_warning: identity.identityWarning } : {}),
-    ...(!anonId && !userId       ? { identity_warning: "no_identity_provided"   } : {}),
+    ...identitySafetyProps,
+    ...(identityWarnings.length ? { identity_warning: [...new Set(identityWarnings.join(",").split(","))].join(",") } : {}),
   };
 
   if (env.SEGMENT_WRITE_KEY) {
@@ -1200,6 +1234,7 @@ async function handleIdentify(request, env, ctx) {
   // FIX 6: body.orderId (DOM-sourced via PREAUTH_SCRIPT) takes priority
   const orderId   = body.orderId || resolveOrderId(body) || null;
   const rawTraits = body.traits  || {};
+  const emailHash = await resolveEmailHashFromBody(body);
 
   if (!userId) {
     if (env.SEGMENT_WRITE_KEY && anonId) {
@@ -1241,7 +1276,7 @@ async function handleIdentify(request, env, ctx) {
   // FIX 6: eden_attr cookie as 5th source; corrected orderId
   const identifyCookieAttr = canUseAttribution ? extractPreAuthAttribution(request) : null;
   const storedAttribution = env.GCLID_KV && canUseAttribution
-    ? await resolveAttribution(env.GCLID_KV, anonId, userId, orderId, null, identifyCookieAttr)
+    ? await resolveAttribution(env.GCLID_KV, anonId, userId, orderId, null, identifyCookieAttr, null, emailHash)
     : identifyCookieAttr ? stripInternalFields(identifyCookieAttr) : null;
 
   const attributionTraits = {};
@@ -1288,6 +1323,13 @@ async function handleIdentify(request, env, ctx) {
         ).catch(err => console.error("[eden-analytics] KV email hash write:", err))
       );
     }
+  }
+
+  if (env.GCLID_KV && canUseAttribution && storedAttribution && emailHash) {
+    ctx.waitUntil(
+      storeAttribution(env.GCLID_KV, KV_EMAIL_ATTR_PREFIX + emailHash, storedAttribution)
+        .catch(err => console.error("[eden-analytics] identify email attribution bridge:", err))
+    );
   }
 
   if (env.SEGMENT_WRITE_KEY) {
@@ -1357,8 +1399,9 @@ async function handlePreserveAttribution(request, env, ctx) {
   const cookieAnonId = readCookie(request, "eden_anon_id")
                     || readCookie(request, "eden_anonymous_id");
   const anonId  = cookieAnonId || body.anonymousId;
-  const userId  = body.userId;
+  const userId  = resolveUserIdFromBody(body);
   const orderId = body.orderId;
+  const emailHash = await resolveEmailHashFromBody(body);
 
   if (!env.GCLID_KV) return jsonResponse({ ok: true, skipped: "no_kv" });
   if (!canUseAttribution) return jsonResponse({ ok: true, skipped: "attribution_suppressed", gpc_opt_out: gpcOptOut });
@@ -1369,13 +1412,14 @@ async function handlePreserveAttribution(request, env, ctx) {
   const cookieGclAu        = preserveCookieAttr?._gcl_au || null;
 
   const attribution = await resolveAttribution(
-    env.GCLID_KV, anonId, userId, orderId, cookieGclAu, preserveCookieAttr
+    env.GCLID_KV, anonId, userId, orderId, cookieGclAu, preserveCookieAttr, null, emailHash
   );
   if (!attribution) return jsonResponse({ ok: true, skipped: "no_attribution" });
 
   const writes = [];
   if (orderId) writes.push(storeAttribution(env.GCLID_KV, KV_ORDER_PREFIX + orderId, attribution).catch(console.error));
   if (userId)  writes.push(storeAttribution(env.GCLID_KV, KV_USER_PREFIX  + userId,  attribution).catch(console.error));
+  if (emailHash) writes.push(storeAttribution(env.GCLID_KV, KV_EMAIL_ATTR_PREFIX + emailHash, attribution).catch(console.error));
   writes.push(...storeGclAuBridgeAttribution(env.GCLID_KV, attribution));
   writes.push(...storeGoogleClickBridgeAttribution(env.GCLID_KV, attribution));
   if (writes.length) ctx.waitUntil(Promise.all(writes));
@@ -1691,21 +1735,22 @@ async function getGoogleClickBridgeAttribution(kv, googleClickIds) {
 
 // =============================================================================
 // resolveAttribution — v5.36
-// Five sources merged lowest → highest priority.
+// Six sources merged lowest → highest priority.
 // FIX 4: stripInternalFields() applied to cookie fallback when kv=null.
 // =============================================================================
 
 async function resolveAttribution(
-  kv, anonId, userId, orderId = null, gclAu = null, cookieAttribution = null, googleClickIds = null
+  kv, anonId, userId, orderId = null, gclAu = null, cookieAttribution = null, googleClickIds = null, emailHash = null
 ) {
   if (!kv) {
     return cookieAttribution ? stripInternalFields(cookieAttribution) : null;
   }
 
-  const [fromAnon, fromUser, fromOrder, fromGcl, fromClick] = await Promise.all([
+  const [fromAnon, fromUser, fromOrder, fromEmail, fromGcl, fromClick] = await Promise.all([
     anonId  ? getAttribution(kv, KV_ANON_PREFIX  + anonId)  : Promise.resolve(null),
     userId  ? getAttribution(kv, KV_USER_PREFIX   + userId)  : Promise.resolve(null),
     orderId ? getAttribution(kv, KV_ORDER_PREFIX  + orderId) : Promise.resolve(null),
+    emailHash ? getAttribution(kv, KV_EMAIL_ATTR_PREFIX + emailHash) : Promise.resolve(null),
     gclAu   ? getGclAuBridgeAttribution(kv, gclAu)           : Promise.resolve(null),
     googleClickIds ? getGoogleClickBridgeAttribution(kv, googleClickIds) : Promise.resolve(null),
   ]);
@@ -1714,6 +1759,7 @@ async function resolveAttribution(
     ...(cookieAttribution ? stripInternalFields(cookieAttribution) : {}), // lowest
     ...(fromClick || {}),   // exact Google click/braid bridge
     ...(fromGcl   || {}),   // cross-domain bridge
+    ...(fromEmail || {}),   // deterministic email bridge
     ...(fromOrder || {}),   // order-level preserve
     ...(fromUser  || {}),   // user-level preserve
     ...(fromAnon  || {}),   // original landing page — WINS ALL
@@ -2158,28 +2204,130 @@ function resolveOrderId(body) {
   );
 }
 
+function cleanIdentityValue(value) {
+  if (value === undefined || value === null) return null;
+  const cleaned = String(value).trim();
+  if (!cleaned || cleaned === "null" || cleaned === "undefined") return null;
+  return cleaned;
+}
+
+function looksLikeEmail(value) {
+  return !!value && /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(String(value).trim());
+}
+
+function resolveMasterUserIdFromBody(body) {
+  return cleanIdentityValue(
+    body.master_user_id ||
+    body.masterUserId ||
+    body.properties?.master_user_id ||
+    body.properties?.masterUserId ||
+    body.properties?.identity?.master_user_id ||
+    body.properties?.identity?.masterUserId ||
+    body.context?.traits?.master_user_id ||
+    body.context?.traits?.masterUserId ||
+    body.traits?.master_user_id ||
+    body.traits?.masterUserId ||
+    null
+  );
+}
+
+function resolveExplicitTopLevelUserIdFromBody(body) {
+  return cleanIdentityValue(body.userId || body.user_id || null);
+}
+
+function resolveLegacyUserIdFromBody(body) {
+  return cleanIdentityValue(
+    body.properties?.userId ||
+    body.properties?.user_id ||
+    body.properties?.patient_id ||
+    body.properties?.customer_id ||
+    body.properties?.ecommerce?.userId ||
+    body.properties?.healthos?.userId ||
+    body.properties?.healthos?.user_id ||
+    body.properties?.healthos?.patient_id ||
+    body.properties?.healthos?.patientId ||
+    body.properties?.healthos?.customer_id ||
+    body.properties?.healthos?.member_id ||
+    body.context?.traits?.userId ||
+    body.context?.traits?.user_id ||
+    body.context?.traits?.patient_id ||
+    body.context?.traits?.patientId ||
+    body.context?.traits?.customer_id ||
+    body.context?.traits?.member_id ||
+    body.patient_id ||
+    body.patientId ||
+    body.customer_id ||
+    body.member_id ||
+    null
+  );
+}
+
+function resolveCustomerIoIdFromBody(body) {
+  return cleanIdentityValue(
+    body.properties?.customerio_id ||
+    body.properties?.customer_io_id ||
+    body.properties?.cio_id ||
+    body.context?.traits?.customerio_id ||
+    body.context?.traits?.customer_io_id ||
+    body.context?.traits?.cio_id ||
+    body.traits?.customerio_id ||
+    body.traits?.customer_io_id ||
+    body.traits?.cio_id ||
+    body.customerio_id ||
+    body.customer_io_id ||
+    body.cio_id ||
+    null
+  );
+}
+
 function resolveUserIdFromBody(body) {
-  return body.userId||body.user_id||
-    body.properties?.userId||body.properties?.user_id||
-    body.properties?.patient_id||body.properties?.customer_id||
-    body.properties?.ecommerce?.userId||
-    body.properties?.healthos?.userId||
-    body.properties?.healthos?.user_id||
-    body.properties?.healthos?.patient_id||
-    body.properties?.healthos?.patientId||
-    body.properties?.healthos?.customer_id||
-    body.properties?.healthos?.member_id||
-    body.context?.traits?.userId||
-    body.context?.traits?.user_id||
-    body.context?.traits?.patient_id||
-    body.context?.traits?.patientId||
-    body.context?.traits?.customer_id||
-    body.context?.traits?.member_id||
-    body.patient_id||
-    body.patientId||
-    body.customer_id||
-    body.member_id||
-    null;
+  const masterUserId = resolveMasterUserIdFromBody(body);
+  const explicitUserId = resolveExplicitTopLevelUserIdFromBody(body);
+  const candidate = masterUserId || explicitUserId;
+  const customerIoId = resolveCustomerIoIdFromBody(body);
+
+  if (!candidate) return null;
+  if (looksLikeEmail(candidate)) return null;
+  if (customerIoId && candidate === customerIoId) return null;
+  return candidate;
+}
+
+function buildIdentitySafetyProperties(body, anonId, userId) {
+  const warnings = [];
+  const masterUserId = resolveMasterUserIdFromBody(body);
+  const explicitUserId = resolveExplicitTopLevelUserIdFromBody(body);
+  const candidateUserId = masterUserId || explicitUserId;
+  const legacyUserId = resolveLegacyUserIdFromBody(body);
+  const customerIoId = resolveCustomerIoIdFromBody(body);
+  const email = resolveEmailFromBody(body);
+
+  if (!masterUserId && legacyUserId && !explicitUserId) warnings.push("ignored_legacy_user_id_without_master_user_id");
+  if (explicitUserId && !masterUserId) warnings.push("using_top_level_user_id_without_master_user_id");
+  if (explicitUserId && legacyUserId && explicitUserId !== legacyUserId) warnings.push("top_level_user_id_differs_from_legacy_user_id");
+  if (userId && anonId && String(userId) === String(anonId)) warnings.push("anonymousId_equals_userId");
+  if (candidateUserId && customerIoId && String(candidateUserId) === String(customerIoId)) warnings.push("customerio_id_not_allowed_as_user_id");
+  if (candidateUserId && looksLikeEmail(candidateUserId)) warnings.push("email_not_allowed_as_user_id");
+  if (candidateUserId && email && String(candidateUserId).toLowerCase() === String(email).trim().toLowerCase()) warnings.push("email_not_allowed_as_user_id");
+
+  const method = masterUserId
+    ? "master_user_id"
+    : explicitUserId
+      ? "top_level_user_id"
+      : legacyUserId
+        ? "legacy_id_ignored"
+        : email
+          ? "email_only_no_user_id"
+          : anonId
+            ? "anonymous_only"
+            : "no_identity_signal";
+
+  return {
+    identity_resolution_method: method,
+    identity_has_master_user_id: !!masterUserId,
+    identity_has_email: !!email,
+    identity_has_anonymous_id: !!anonId,
+    ...(warnings.length ? { identity_warning: [...new Set(warnings)].join(",") } : {}),
+  };
 }
 
 function resolveEmailFromBody(body) {
@@ -2191,6 +2339,24 @@ function resolveEmailFromBody(body) {
     body.context?.traits?.email           ||
     null
   );
+}
+
+async function resolveEmailHashFromBody(body) {
+  const explicitHash = cleanIdentityValue(
+    body.properties?.email_sha256 ||
+    body.properties?.emailHash ||
+    body.properties?.customer_email_sha256 ||
+    body.properties?.ecommerce?.email_sha256 ||
+    body.traits?.email_sha256 ||
+    body.context?.traits?.email_sha256 ||
+    body.email_sha256 ||
+    null
+  );
+  if (explicitHash) return explicitHash.toLowerCase();
+
+  const email = resolveEmailFromBody(body);
+  if (!email || typeof email !== "string") return null;
+  return sha256(email);
 }
 
 function resolveGclAuFromBody(body) {
@@ -2231,7 +2397,7 @@ function resolveGoogleClickIdsFromBody(body) {
 
 function resolveIdentityFromBody(request, body) {
   const cookieAnonId = readCookie(request,"eden_anon_id")||readCookie(request,"eden_anonymous_id");
-  const userId = resolveUserIdFromBody(body);
+  let userId = resolveUserIdFromBody(body);
   let anonymousId =
     cookieAnonId||
     body.anonymousId||body.anonymous_id||body.anonymoous_id||
@@ -2241,9 +2407,19 @@ function resolveIdentityFromBody(request, body) {
     body.context?.traits?.anonymousId||
     body.context?.traits?.anonymous_id||
     null;
+  const identitySafety = buildIdentitySafetyProperties(body, anonymousId, userId);
+  const identityWarnings = identitySafety.identity_warning
+    ? identitySafety.identity_warning.split(",")
+    : [];
+  if (anonymousId && userId && String(anonymousId) === String(userId)) {
+    userId = null;
+    if (!identityWarnings.includes("anonymousId_equals_userId")) {
+      identityWarnings.push("anonymousId_equals_userId");
+    }
+  }
   return {
     anonymousId, userId,
-    identityWarning: anonymousId&&userId&&anonymousId===userId ? "anonymousId_equals_userId" : undefined,
+    identityWarning: identityWarnings.length ? identityWarnings.join(",") : undefined,
   };
 }
 
@@ -2258,6 +2434,37 @@ function canUseAttributionForRequest(env, gpcOptOut) {
 
 function privacyProperties(request) {
   return { gpc_opt_out: isGpcOptOut(request) };
+}
+
+function requestContextProperties(request, body = {}) {
+  const context = body?.context || {};
+  const props = body?.properties || {};
+  const ua = firstValue(
+    context.userAgent,
+    context.user_agent,
+    props.user_agent,
+    request.headers.get("User-Agent")
+  );
+  const cf = request.cf || {};
+  const ipPresent = !!(
+    request.headers.get("CF-Connecting-IP") ||
+    request.headers.get("True-Client-IP") ||
+    request.headers.get("X-Forwarded-For")
+  );
+
+  return {
+    user_agent: ua || undefined,
+    device_type: ua ? (isMobile(ua) ? "mobile" : "desktop") : undefined,
+    first_party_device_id: props.first_party_device_id || context.traits?.first_party_device_id || undefined,
+    ga_session_cookie: props.ga_session_cookie || context.campaign?.ga_session_cookie || undefined,
+    ga_session_id: props.ga_session_id || context.campaign?.ga_session_id || undefined,
+    ga_session_number: props.ga_session_number || context.campaign?.ga_session_number || undefined,
+    ip_capture_status: ipPresent ? "available_not_forwarded_raw" : "not_available",
+    ip_country: cf.country || undefined,
+    ip_region: cf.region || undefined,
+    ip_city: cf.city || undefined,
+    ip_timezone: cf.timezone || undefined,
+  };
 }
 
 
@@ -2323,7 +2530,7 @@ function isStaticAsset(url) {
 
 
 // =============================================================================
-// EMAIL HASHING
+// CONTACT IDENTIFIER HASHING
 // =============================================================================
 
 async function hashEmail(props) {
@@ -2333,10 +2540,26 @@ async function hashEmail(props) {
     if ((k === "email" || k === "customerEmail") && typeof v === "string") {
       out["email_sha256"] = await sha256(v); out[k] = v; continue;
     }
+    if ((k === "phone" || k === "phone_number" || k === "phoneNumber" || k === "customerPhone") && typeof v === "string") {
+      const normalizedPhone = normalizePhone(v);
+      if (normalizedPhone) out["phone_sha256"] = await sha256(normalizedPhone);
+      out[k] = v;
+      continue;
+    }
     if (v && typeof v === "object" && !Array.isArray(v)) { out[k] = await hashEmail(v); continue; }
     out[k] = v;
   }
   return out;
+}
+
+function normalizePhone(value) {
+  if (value === undefined || value === null) return "";
+  const raw = String(value).trim();
+  if (!raw) return "";
+  const hasPlus = raw.charAt(0) === "+";
+  const digits = raw.replace(/\D/g, "");
+  if (!digits) return "";
+  return hasPlus ? `+${digits}` : digits;
 }
 
 async function sha256(value) {
