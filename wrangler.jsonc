@@ -1,0 +1,93 @@
+{
+  "$schema": "../node_modules/wrangler/config-schema.json",
+  "name": "eden-analytics",
+  "main": "./cloudflare-workers/eden-analytics.js",
+  "account_id": "b08c39f6974b2943b22501e63592191b",
+  "compatibility_date": "2026-07-09",
+  "workers_dev": false,
+  "preview_urls": false,
+  "routes": [
+    { "pattern": "eden.health/*", "zone_name": "eden.health" },
+    { "pattern": "www.eden.health/*", "zone_name": "eden.health" },
+    { "pattern": "app.eden.health/*", "zone_name": "eden.health" },
+    { "pattern": "collect.eden.health/*", "zone_name": "eden.health" }
+  ],
+  "kv_namespaces": [
+    {
+      "binding": "GCLID_KV",
+      "id": "12c53db492b7419d8717d6d23831d186"
+    },
+    {
+      "binding": "PRIVACY_LEDGER_KV",
+      "id": "aeb98a81cfa24c7ab55e0d7419627543"
+    },
+    {
+      "binding": "AD_CLICK_KV",
+      "id": "82908a4725ad41a18dc307cbfc52fb72"
+    }
+  ],
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "CONVERSION_COORDINATOR",
+        "class_name": "ConversionCoordinator"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v556_conversion_coordinator_v1",
+      "new_sqlite_classes": ["ConversionCoordinator"]
+    }
+  ],
+  "queues": {
+    "producers": [
+      {
+        "binding": "AD_CLICK_SNAPSHOT_QUEUE",
+        "queue": "eden-health-ad-click-memory"
+      }
+    ],
+    "consumers": [
+      {
+        "queue": "eden-health-ad-click-memory",
+        "max_batch_size": 10,
+        "max_batch_timeout": 5,
+        "max_retries": 3,
+        "retry_delay": 60,
+        "dead_letter_queue": "eden-health-ad-click-memory-dlq"
+      }
+    ]
+  },
+  "vars": {
+    "BLOCK_LEGACY_GTM": "false",
+    "EDEN_BROWSER_CAP_ENFORCEMENT_MODE": "enforce",
+    "EDEN_BROWSER_SEGMENT_DELIVERY_MODE": "sync",
+    "EDEN_HEALTH_TRACKING_ENRICHMENT_MODE": "all",
+    "EDEN_AD_CLICK_MEMORY_MODE": "cookie",
+    "EDEN_AD_CLICK_KV_INDEX_MODE": "pointer",
+    "EDEN_AD_CLICK_KV_RESOLVER_MODE": "pointer_only",
+    "EDEN_AD_CLICK_KV_RESOLVER_CONTRACT_ACCEPTED": "false",
+    "EDEN_AD_CLICK_REVERSE_KV_RETENTION_MODE": "ttl",
+    "EDEN_AD_CLICK_REVERSE_KV_TTL_SECONDS": "7776000",
+    "EDEN_AD_CLICK_POINTER_KV_TTL_SECONDS": "7776000",
+    "AD_CLICK_MEMORY_QUEUE_CONSUMER_ENABLED": "true",
+    "AD_CLICK_BIGQUERY_PROJECT_ID": "eden-data-warehouse",
+    "AD_CLICK_BIGQUERY_DATASET_ID": "attribution"
+  },
+  "secrets": {
+    "required": [
+      "SEGMENT_WRITE_KEY",
+      "SERVER_API_SECRET",
+      "BROWSER_CAP_HMAC_SECRET",
+      "PRIVACY_LEDGER_HMAC_SECRET",
+      "AD_CLICK_GOOGLE_SERVICE_ACCOUNT_KEY"
+    ]
+  },
+  "observability": {
+    "enabled": true,
+    "logs": {
+      "invocation_logs": true,
+      "head_sampling_rate": 0.1
+    }
+  }
+}

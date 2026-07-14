@@ -1,163 +1,68 @@
-# eden-analytics-worker
+# Eden Analytics Worker v5.56 — production repository
 
-Cloudflare Edge Worker — intercepts `eden.health` + `app.eden.health`, enriches ALL events (client and server-side) with gclid/UTM attribution via Cloudflare KV, strips PHI, and routes to Segment → Google Ads, Mixpanel, BigQuery and other destinations.
+This folder is a complete replacement for the old `phani-droid/eden-analytics-worker` repository contents. A pull request runs syntax checks, the full Worker regression suite, the Durable Object suite, and a Wrangler dry-run. Merging the PR into `main` deploys one atomic version of `eden-analytics` to Cloudflare and verifies the exact release through the live health endpoint.
 
----
+## Source and compatibility
 
-## What this worker does
+- Production baseline: CEO ZIP `eden-marketing-architecture-implementation-main (1).zip`, Worker SHA-256 `2250affdf76f996d8e32ee772c248a0831d4aa7d11dd671efe6e8399e5e38139`.
+- `eden-conversion-coordinator.js` is copied unchanged from that ZIP.
+- Pipeline remains `5.56`; enrichment remains `5.54`.
+- Existing attribution, privacy, first-touch, ad-click pointer, Queue, KV, server-authority, conversion-idempotency, and `OS_*` rules are retained.
 
-```
-User clicks Google Ad → gclid in URL
-  → Worker intercepts page request
-  → Extracts gclid + UTMs
-  → Stores in Cloudflare KV against anonymousId (90 days)
-  → Sets ITP-resistant HttpOnly cookie
+Compatibility additions:
 
-Any future event — client OR server-side:
-  → Goes through worker /collect or /server-collect
-  → Worker looks up gclid from KV automatically
-  → Attaches gclid to event properties
-  → Strips PHI (email, name, phone, card data, health data)
-  → Hashes raw email → email_sha256
-  → Forwards to Segment
+1. Accept AnalyticsBrowser aliases `/collect/t`, `/collect/p`, `/collect/s`, `/collect/i`, `/collect/a`, `/collect/g`, and defensive `/collect/v1/*` aliases through the same security gates.
+2. Allow one safe collector-first bootstrap for an allowlisted same-site browser with no owner state. The Worker, not the request body, creates the anonymous ID, session, and signed capability.
+3. Preserve the Webflow pattern where `eden_anon_id` may exist before `eden_session_id`.
+4. Use synchronous browser-to-Segment delivery in production. Segment failure returns a retryable `503` rather than a false-success `200`.
+5. Send a deterministic `m-<32 hex>` top-level Segment `messageId`, suitable for Mixpanel `$insert_id`, while retaining the original producer/coordinator ID in `properties.segment_source_message_id`.
 
-Segment routes to all destinations:
-  → Google Ads → conversion attributed to paid click ✓
-  → Mixpanel → full patient journey with attribution ✓
-  → BigQuery → data warehouse ✓
-  → Customer.io → lifecycle triggers ✓
-```
+## Repository layout
 
----
+| Path | Purpose |
+| --- | --- |
+| `cloudflare-workers/eden-analytics.js` | v5.56 Worker plus bounded compatibility fixes |
+| `cloudflare-workers/eden-conversion-coordinator.js` | unchanged CEO Durable Object implementation |
+| `wrangler.jsonc` | complete routes, KV, Durable Object migration, Queue, variables, and observability configuration |
+| `scripts/test-eden-analytics-worker-local.mjs` | full Worker regression suite with Mixpanel-safe ID assertions |
+| `scripts/test-eden-conversion-coordinator-v556-local.mjs` | strongly consistent coordinator suite |
+| `.github/workflows/deploy.yml` | PR validation and `main` auto-deployment |
+| `DEPLOYMENT-GUIDE.md` | beginner-safe setup, PR, deployment, smoke-test, and rollback steps |
 
-## Endpoints
+## Local validation
 
-| Endpoint | Method | Who calls it | What it does |
-|---|---|---|---|
-| `/*` | GET | Browser | Intercepts page loads, sets cookie, fires page_viewed |
-| `/collect` | POST | analytics.js (Danny) | Client-side events — enriched with KV gclid |
-| `/server-collect` | POST | Node.js API (Ryon) | Server-side events — enriched with KV gclid |
-| `/eden-health-check` | GET | Anyone | Health check |
-
----
-
-## One-time setup
-
-### 1. Create KV namespace
 ```bash
-wrangler kv:namespace create "GCLID_KV"
-```
-Copy the `id` from the output → paste into `wrangler.toml` `[[kv_namespaces]]` section.
-
-### 2. Set secrets
-```bash
-wrangler secret put SEGMENT_WRITE_KEY
-# Paste your Segment write key when prompted
-
-wrangler secret put SERVER_API_SECRET
-# Paste any secret string — used to authenticate /server-collect
+npm ci
+npm test
+npm run dry-run
 ```
 
-### 3. Deploy
-```bash
-wrangler deploy
-```
+## Required GitHub Actions secrets
 
----
+- `CLOUDFLARE_API_TOKEN`
+- `CLOUDFLARE_ACCOUNT_ID`
 
-## Adding new events
+## Required Cloudflare Worker secrets
 
-**No worker changes needed.**
+These belong on the existing `eden-analytics` Worker and must never be committed:
 
-Client-side:
-```javascript
-analytics.track('your_new_event', { prop1: 'value' });
-// Worker forwards to Segment automatically with gclid attached
-```
+- `SEGMENT_WRITE_KEY`
+- `SERVER_API_SECRET`
+- `BROWSER_CAP_HMAC_SECRET`
+- `PRIVACY_LEDGER_HMAC_SECRET`
+- `AD_CLICK_GOOGLE_SERVICE_ACCOUNT_KEY`
 
-Server-side (Ryon):
-```javascript
-await fetch('https://app.eden.health/server-collect', {
-  method: 'POST',
-  headers: {
-    'Content-Type': 'application/json',
-    'X-Eden-Server-Secret': process.env.EDEN_SERVER_API_SECRET,
-  },
-  body: JSON.stringify({
-    event:       'OS_qualified_first_order',
-    userId:      patient.userId,
-    anonymousId: patient.anonId,  // ← worker uses this to look up gclid from KV
-    properties:  {
-      order_id: order.id,
-      value:    order.amountCents / 100,
-      currency: 'USD',
-      // NO gclid needed — worker adds automatically
-    }
-  })
-});
-```
+## Browser/application contract
 
-## Adding new destinations
+No Webflow or app change is required for the supplied scripts if all of the following remain true:
 
-**No worker changes needed.**
+- Webflow sends browser events to `https://collect.eden.health/collect` with `credentials: "include"`.
+- The app AnalyticsBrowser `apiHost` remains `https://app.eden.health/collect`; its method suffixes are handled by this Worker.
+- Authoritative purchase/payment/order outcomes continue through authenticated `/server-collect`, not browser authority.
+- App server requests retain `X-Eden-Server-Secret` and stable transaction/order identifiers.
 
-Configure destination in Segment UI only.
-Worker forwards everything to Segment as-is.
-Segment routes to all configured destinations.
+This release fixes collection and destination compatibility. It does not fix query parameters stripped by `tryeden.com` redirects or missing charge-bound attribution envelopes inside HealthOS.
 
----
+## Security migration warning
 
-## PHI stripping
-
-These fields are automatically stripped from ALL events before Segment:
-
-**PII:** `customerEmail`, `email`, `firstName`, `lastName`, `phoneNumber`, `phone`, `full_name`, `address`, `dob`, `date_of_birth`
-
-**Health data:** `weight_lbs`, `height_ft`, `bmi_value`, `goal_weight_lbs`, `highest_weight_lbs`, `selected_conditions`, `selected_medications`, `selected_allergies`, `lbs_lost`, `old_dose_mg`, `new_dose_mg`, `medication`
-
-**PCI:** `card_number`, `card_exp_date`, `card_cvc`, `OS_card_number`, `OS_card_exp_date`, `OS_card_cvc`
-
-Raw `email` is automatically hashed → `email_sha256` (SHA-256, lowercase, trimmed).
-
-To add a new PHI field — add it to `PHI_PROPS` in `eden-analytics-worker.js` and deploy.
-
----
-
-## Architecture
-
-```
-eden.health / app.eden.health
-        ↓
-  Cloudflare Worker (this)
-  ├── KV: stores gclid per anonymousId (90 days)
-  ├── PHI stripping
-  ├── email → email_sha256
-  └── forwards enriched events
-        ↓
-     Segment
-  ├── Google Ads  → EdenOS - Purchase, EdenOS - QFO
-  ├── Mixpanel    → product analytics
-  ├── BigQuery    → data warehouse
-  └── Customer.io → lifecycle
-```
-
----
-
-## Files
-
-| File | Purpose |
-|---|---|
-| `eden-analytics-worker.js` | Worker code — single source of truth |
-| `wrangler.toml` | Cloudflare config — routes, KV binding |
-| `.github/workflows/deploy.yml` | Auto-deploy on push to main |
-| `.gitignore` | Keeps secrets out of git |
-
----
-
-## Environment variables
-
-| Variable | Where set | Required | Description |
-|---|---|---|---|
-| `SEGMENT_WRITE_KEY` | `wrangler secret put` | ✅ Yes | Segment write key |
-| `SERVER_API_SECRET` | `wrangler secret put` | Optional | Authenticates /server-collect |
-| `GCLID_KV` | `wrangler.toml` | ✅ Yes | KV namespace binding |
+The existing `phani-droid/eden-analytics-worker` repository tracks `.dev.vars`, `.DS_Store`, and `.github/.DS_Store`; its ignore file is named `gitignore` instead of `.gitignore`. This package corrects the ignore filename and never includes secret values. Remove the tracked files during migration and treat credentials historically stored in `.dev.vars` as potentially exposed. Coordinate rotation with each owner; in particular, rotating `SERVER_API_SECRET` without updating the app server at the same time will break `/server-collect`.
