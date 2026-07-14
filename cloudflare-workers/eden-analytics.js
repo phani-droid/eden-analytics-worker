@@ -6,7 +6,7 @@ var __name = (target, value) => __defProp(target, "name", { value, configurable:
 // eden-analytics-worker.js
 var PIPELINE_VERSION = "5.56";
 var ENRICHMENT_VERSION = "5.54";
-var RELEASE_REVISION = "v556-phani-analytics-compat-20260715";
+var RELEASE_REVISION = "v556-phani-all-events-delivery-20260715";
 var ALLOWED_ORIGINS = [
   "https://eden.health",
   "https://www.eden.health",
@@ -1488,6 +1488,7 @@ var eden_analytics_worker_default = {
           browser_capability_previous_secret_configured: !!env[BROWSER_CAPABILITY_PREVIOUS_SECRET_ENV],
           browser_capability_enforcement_mode: normalizeBrowserCapabilityEnforcementMode(env),
           browser_segment_delivery_mode: String(env.EDEN_BROWSER_SEGMENT_DELIVERY_MODE || "async").trim().toLowerCase() === "sync" ? "sync" : "async",
+          server_segment_delivery_mode: String(env.EDEN_SERVER_SEGMENT_DELIVERY_MODE || "async").trim().toLowerCase() === "sync" ? "sync" : "async",
           browser_capability_cookie: BROWSER_CAPABILITY_COOKIE_NAME,
           browser_capability_ttl_seconds: BROWSER_CAPABILITY_TTL_SECONDS,
           browser_capability_bootstrap_path: "/browser-capability",
@@ -3100,6 +3101,29 @@ async function handleServerCollect(request, env, ctx) {
       || (serverSessionId ? `eden_session_${(await sha256Raw(serverSessionId)).slice(0, 32)}` : null)
       || (orderId && !conversionHasOrderIdentityConflict ? `eden_order_${(await sha256Raw(orderId)).slice(0, 32)}` : null)
       || (isConversionEvent && conversionKeyDetails?.rawValue ? `eden_transaction_${(await sha256Raw(conversionKeyDetails.rawValue)).slice(0, 32)}` : null);
+  // Authenticated producers also emit operational events that legitimately do
+  // not have a person, order, browser session, or conversion transaction yet.
+  // Segment still requires either userId or anonymousId for those envelopes.
+  // Give only that individual event an opaque delivery identity instead of
+  // dropping it or collapsing unrelated traffic onto a shared "server" user.
+  // This value is never used for attribution lookup, identity linking, KV,
+  // Durable Object ownership, or ad-click memory.
+  const serverEventScopedDeliveryId = !serverSegmentAnonymousId
+    && eventName
+    && Object.keys(serverEventNativeAttribution || {}).length === 0
+    ? `eden_event_${(await sha256Raw([
+      eventName,
+      String(body.messageId || body.message_id || body.eventId || body.event_id || body.originalTimestamp || body.timestamp || serverReceivedAt),
+      JSON.stringify(body.properties || {}).slice(0, 4096)
+    ].join("\0"))).slice(0, 32)}`
+    : null;
+  const serverSegmentDeliveryId = serverSegmentAnonymousId || serverEventScopedDeliveryId;
+  if (serverEventScopedDeliveryId) {
+    body.properties.event_scoped_delivery_identity = true;
+    body.properties.identity_scope = "event_only";
+    superProps.identity_warning = "event_scoped_delivery_identity";
+  }
+  const synchronousServerSegmentDelivery = String(env.EDEN_SERVER_SEGMENT_DELIVERY_MODE || "async").trim().toLowerCase() === "sync";
   let segmentForwarded = false;
   let conversionRepairEnrichmentForwarded = false;
   let acknowledgedBaseBeforeRepairEnrichment = null;
@@ -3338,22 +3362,67 @@ async function handleServerCollect(request, env, ctx) {
       retryable: true,
       segment_forwarded: false
     }), { status: 503, headers: failedHeaders });
-  } else if (env.SEGMENT_WRITE_KEY && serverSegmentAnonymousId) {
-    segmentForwarded = true;
-    ctx.waitUntil(
-      forwardToSegment(
-        env.SEGMENT_WRITE_KEY,
-        body,
-        serverSegmentAnonymousId,
-        superProps,
-        canUseAttribution ? serverEventNativeAttribution : {}
-      ).catch((err) => console.error("[eden-analytics] server-collect error:", err))
-    );
-  } else if (env.SEGMENT_WRITE_KEY) {
-    // Ownerless Google evidence remains only in the minimized queue/BigQuery
-    // diagnostic lane. Never collapse unrelated events onto a shared synthetic
-    // Segment identity such as the historical literal "server".
-    console.warn(JSON.stringify({ worker: "eden-analytics", event: "server_segment_skipped_no_first_party_identity", event_name: eventName || null }));
+  } else if (env.SEGMENT_WRITE_KEY && serverSegmentDeliveryId) {
+    if (synchronousServerSegmentDelivery) {
+      try {
+        await forwardToSegment(
+          env.SEGMENT_WRITE_KEY,
+          body,
+          serverSegmentDeliveryId,
+          superProps,
+          canUseAttribution ? serverEventNativeAttribution : {}
+        );
+        segmentForwarded = true;
+      } catch (err) {
+        console.error(JSON.stringify({
+          worker: "eden-analytics",
+          event: "server_segment_delivery_failed",
+          retryable: true,
+          event_name: eventName || null,
+          reason: String(err?.message || "unknown").slice(0, 120)
+        }));
+        const failedHeaders = new Headers({
+          "Content-Type": "application/json",
+          "Cache-Control": "no-store",
+          "Retry-After": "5",
+          ...corsHeadersObj(request.headers.get("Origin") || "")
+        });
+        appendAttributionPermissionCookies(failedHeaders, new URL(request.url), attributionPermission);
+        return new Response(JSON.stringify({
+          ok: false,
+          error: "server_segment_delivery_failed",
+          retryable: true,
+          segment_forwarded: false
+        }), { status: 503, headers: failedHeaders });
+      }
+    } else {
+      segmentForwarded = true;
+      ctx.waitUntil(
+        forwardToSegment(
+          env.SEGMENT_WRITE_KEY,
+          body,
+          serverSegmentDeliveryId,
+          superProps,
+          canUseAttribution ? serverEventNativeAttribution : {}
+        ).catch((err) => console.error("[eden-analytics] server-collect error:", err))
+      );
+    }
+  } else if (!env.SEGMENT_WRITE_KEY && synchronousServerSegmentDelivery) {
+    console.error(JSON.stringify({ worker: "eden-analytics", event: "server_segment_configuration_error" }));
+    return new Response(JSON.stringify({
+      ok: false,
+      error: "server_segment_delivery_unavailable",
+      retryable: true,
+      segment_forwarded: false
+    }), {
+      status: 503,
+      headers: {
+        "Content-Type": "application/json",
+        "Cache-Control": "no-store",
+        "Retry-After": "5",
+        ...corsHeadersObj(request.headers.get("Origin") || "")
+      }
+    });
   }
   if (conversionDedupPlan && segmentForwarded && !conversionDedupPlan.skipSegmentDelivery) {
     try {

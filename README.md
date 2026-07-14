@@ -1,5 +1,9 @@
 # Eden Analytics Worker v5.56 — production repository
 
+Release revision: `v556-phani-all-events-delivery-20260715`.
+
+This package adds synchronous acknowledgement for both browser and authenticated server Segment delivery. See `EVENT-DELIVERY-RCA.md` for the exact Worker changes and the separate application producer gaps that cannot be repaired at the edge.
+
 This folder is a complete replacement for the old `phani-droid/eden-analytics-worker` repository contents. A pull request runs syntax checks, the full Worker regression suite, the Durable Object suite, and a Wrangler dry-run. Merging the PR into `main` deploys one atomic version of `eden-analytics` to Cloudflare and verifies the exact release through the live health endpoint.
 
 ## Source and compatibility
@@ -16,6 +20,8 @@ Compatibility additions:
 3. Preserve the Webflow pattern where `eden_anon_id` may exist before `eden_session_id`.
 4. Use synchronous browser-to-Segment delivery in production. Segment failure returns a retryable `503` rather than a false-success `200`.
 5. Send a deterministic `m-<32 hex>` top-level Segment `messageId`, suitable for Mixpanel `$insert_id`, while retaining the original producer/coordinator ID in `properties.segment_source_message_id`.
+6. Synchronously acknowledge authenticated non-conversion server events and expose Segment failures as retryable `503` responses.
+7. Deliver identity-less authenticated operational telemetry through an isolated event-scoped ID without making it an attribution or person key.
 
 ## Repository layout
 

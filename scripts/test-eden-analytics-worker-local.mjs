@@ -11205,4 +11205,71 @@ async function appWebflowAliasesAndSynchronousDeliveryRemainCompatible() {
 
 await appWebflowAliasesAndSynchronousDeliveryRemainCompatible();
 
+async function authenticatedServerEventsAreNeverSilentlyDropped() {
+  const originalFetch = globalThis.fetch;
+  const segmentCalls = [];
+  let segmentStatus = 200;
+  globalThis.fetch = async (url, init = {}) => {
+    if (String(url).startsWith("https://api.segment.io/")) {
+      segmentCalls.push(JSON.parse(init.body));
+      return new Response("{}", { status: segmentStatus });
+    }
+    return new Response("ok", { status: 200 });
+  };
+  const env = {
+    SERVER_API_SECRET: TEST_SERVER_API_SECRET,
+    SEGMENT_WRITE_KEY: "fixture",
+    EDEN_SERVER_SEGMENT_DELIVERY_MODE: "sync",
+    GCLID_KV: new MockKV(),
+  };
+  const request = (body) => new Request("https://app.eden.health/server-collect", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Eden-Server-Secret": TEST_SERVER_API_SECRET,
+    },
+    body: JSON.stringify(body),
+  });
+  try {
+    const ownerless = await productionWorker.fetch(request({
+      type: "track",
+      event: "OS_background_job_started",
+      messageId: "job-started-1",
+      properties: { job_type: "reconciliation" },
+    }), env, makeCtx());
+    assert.equal(ownerless.status, 200, "authenticated ownerless operational event must be delivered");
+    assert.equal((await ownerless.json()).segment_forwarded, true);
+    assert.equal(segmentCalls.at(-1).event, "OS_background_job_started");
+    assert.match(segmentCalls.at(-1).anonymousId || "", /^eden_event_[a-f0-9]{32}$/);
+    assert.equal(segmentCalls.at(-1).properties.event_scoped_delivery_identity, true);
+    assert.equal(segmentCalls.at(-1).properties.identity_scope, "event_only");
+
+    const identified = await productionWorker.fetch(request({
+      type: "track",
+      event: "OS_order_status_changed",
+      userId: "customer-123",
+      properties: { customer_id: "customer-123", order_id: "order-123" },
+    }), env, makeCtx());
+    assert.equal(identified.status, 200, "identified server lifecycle event must be delivered synchronously");
+    assert.equal(segmentCalls.at(-1).event, "OS_order_status_changed");
+
+    segmentStatus = 503;
+    const failed = await productionWorker.fetch(request({
+      type: "track",
+      event: "OS_order_followup_failed_delivery_probe",
+      userId: "customer-123",
+      properties: { customer_id: "customer-123" },
+    }), env, makeCtx());
+    assert.equal(failed.status, 503, "server producer must see retryable Segment failure");
+    const failedBody = await failed.json();
+    assert.equal(failedBody.error, "server_segment_delivery_failed");
+    assert.equal(failedBody.retryable, true);
+    assert.equal(failedBody.segment_forwarded, false);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+}
+
+await authenticatedServerEventsAreNeverSilentlyDropped();
+
 console.log("PASS eden analytics worker local canary/all/off/server/identify enrichment/ad-click memory tests");
