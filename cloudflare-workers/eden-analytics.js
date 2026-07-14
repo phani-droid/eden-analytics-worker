@@ -6,7 +6,7 @@ var __name = (target, value) => __defProp(target, "name", { value, configurable:
 // eden-analytics-worker.js
 var PIPELINE_VERSION = "5.56";
 var ENRICHMENT_VERSION = "5.54";
-var RELEASE_REVISION = "v556-phani-all-events-delivery-20260715";
+var RELEASE_REVISION = "v556-phani-browser-sdk-hotfix-20260715";
 var ALLOWED_ORIGINS = [
   "https://eden.health",
   "https://www.eden.health",
@@ -1599,10 +1599,16 @@ var eden_analytics_worker_default = {
         "/identify", "/collect/i", "/collect/a", "/collect/g",
         "/collect/v1/i", "/collect/v1/a", "/collect/v1/g"
       ]);
+      // AnalyticsBrowser sends internal delivery telemetry to /m. It is not a
+      // customer event and must never enter attribution or identity handling.
+      const browserTelemetryPaths = /* @__PURE__ */ new Set([
+        "/collect/m", "/collect/v1/m"
+      ]);
       if (request.method === "OPTIONS") {
         const browserMutationPaths = new Set([
           ...browserCollectPaths,
           ...browserIdentifyPaths,
+          ...browserTelemetryPaths,
           "/preserve-attribution"
         ]);
         const origin = request.headers.get("Origin") || "";
@@ -1624,6 +1630,8 @@ var eden_analytics_worker_default = {
         return handleServerCollect(request, env, ctx);
       if (browserIdentifyPaths.has(url.pathname) && request.method === "POST")
         return refreshBrowserCapabilityOnSuccess(await handleIdentify(request, env, ctx), env, url.pathname, request);
+      if (browserTelemetryPaths.has(url.pathname) && request.method === "POST")
+        return handleBrowserSdkTelemetry(request);
       if (isBot(request))
         return fetch(requestForOrigin(request));
       if (isSyntheticMonitor(request, url)) {
@@ -1882,13 +1890,30 @@ async function fireFirstTouch(request, env, anonId, session, url, clickIds, utms
   });
 }
 __name(fireFirstTouch, "fireFirstTouch");
+function handleBrowserSdkTelemetry(request) {
+  const origin = request.headers.get("Origin") || "";
+  if (origin && !isAllowedOrigin(origin)) {
+    return new Response("Forbidden", { status: 403, headers: { "Cache-Control": "no-store" } });
+  }
+  const fetchSite = String(request.headers.get("Sec-Fetch-Site") || "").toLowerCase();
+  if (fetchSite === "cross-site") {
+    return new Response("Forbidden", { status: 403, headers: { "Cache-Control": "no-store" } });
+  }
+  return new Response(null, {
+    status: 204,
+    headers: { "Cache-Control": "no-store", ...corsHeadersObj(origin) }
+  });
+}
+__name(handleBrowserSdkTelemetry, "handleBrowserSdkTelemetry");
 async function handleCollect(request, env, ctx, url) {
   const origin = request.headers.get("Origin") || "";
   if (origin && !isAllowedOrigin(origin))
     return new Response("Forbidden", { status: 403 });
   const authFailure = await authorizeBrowserMutationRequest(request, env, "collect");
   if (authFailure) return authFailure;
-  const parsedBody = await parseBoundedJsonRequest(request);
+  // Segment AnalyticsBrowser uses text/plain for sendBeacon-compatible JSON.
+  // Accept that media type only at the governed browser collector boundary.
+  const parsedBody = await parseBoundedJsonRequest(request, { allowTextPlainJson: true });
   if (parsedBody.response) return parsedBody.response;
   const body = parsedBody.value;
   const browserAdmission = sanitizeBrowserCollectorBody(body);
@@ -3563,7 +3588,7 @@ async function handleIdentify(request, env, ctx) {
     return new Response("Forbidden", { status: 403 });
   const authFailure = await authorizeBrowserMutationRequest(request, env, "identify");
   if (authFailure) return authFailure;
-  const parsedBody = await parseBoundedJsonRequest(request);
+  const parsedBody = await parseBoundedJsonRequest(request, { allowTextPlainJson: true });
   if (parsedBody.response) return parsedBody.response;
   const body = parsedBody.value;
   // Browser code cannot prove a stable Eden user, order, group, email, or phone.
@@ -9834,9 +9859,11 @@ async function readBoundedRequestText(request, maxBytes = MAX_JSON_BODY_BYTES) {
   return { tooLarge: false, text };
 }
 __name(readBoundedRequestText, "readBoundedRequestText");
-async function parseBoundedJsonRequest(request) {
+async function parseBoundedJsonRequest(request, { allowTextPlainJson = false } = {}) {
   const contentType = String(request.headers.get("Content-Type") || "").split(";", 1)[0].trim().toLowerCase();
-  if (!(contentType === "application/json" || contentType.endsWith("+json"))) {
+  const isJson = contentType === "application/json" || contentType.endsWith("+json");
+  const isBrowserBeaconJson = allowTextPlainJson && contentType === "text/plain";
+  if (!(isJson || isBrowserBeaconJson)) {
     return { response: new Response("Content-Type must be application/json", { status: 415 }), value: null };
   }
   const body = await readBoundedRequestText(request);

@@ -1,6 +1,6 @@
 # Eden Analytics Worker v5.56 — production repository
 
-Release revision: `v556-phani-all-events-delivery-20260715`.
+Release revision: `v556-phani-browser-sdk-hotfix-20260715`.
 
 This package adds synchronous acknowledgement for both browser and authenticated server Segment delivery. See `EVENT-DELIVERY-RCA.md` for the exact Worker changes and the separate application producer gaps that cannot be repaired at the edge.
 
@@ -22,6 +22,8 @@ Compatibility additions:
 5. Send a deterministic `m-<32 hex>` top-level Segment `messageId`, suitable for Mixpanel `$insert_id`, while retaining the original producer/coordinator ID in `properties.segment_source_message_id`.
 6. Synchronously acknowledge authenticated non-conversion server events and expose Segment failures as retryable `503` responses.
 7. Deliver identity-less authenticated operational telemetry through an isolated event-scoped ID without making it an attribution or person key.
+8. Accept Segment AnalyticsBrowser beacon JSON sent as `text/plain` on browser `/collect/*` methods. The bounded JSON parser, origin checks, capability checks, identity rules, privacy rules, and all v5.56 enrichment still run.
+9. Acknowledge the AnalyticsBrowser metrics method `/collect/m` (and `/collect/v1/m`) with `204`; SDK telemetry is not converted into a customer analytics event.
 
 ## Repository layout
 
@@ -68,6 +70,8 @@ No Webflow or app change is required for the supplied scripts if all of the foll
 - App server requests retain `X-Eden-Server-Secret` and stable transaction/order identifiers.
 
 This release fixes collection and destination compatibility. It does not fix query parameters stripped by `tryeden.com` redirects or missing charge-bound attribution envelopes inside HealthOS.
+
+Expected app Network responses after deployment are `/collect/t` = `200`, `/collect/i` = `200`, and `/collect/m` = `204`. Repeated `415` responses on `/collect/t` or `/collect/i` mean this release is not active on the app route.
 
 ## Security migration warning
 

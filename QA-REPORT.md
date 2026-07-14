@@ -1,5 +1,12 @@
 # QA report
 
+## Browser SDK hotfix addendum
+
+- Root cause reproduced: Segment AnalyticsBrowser beacon requests to `/collect/t` and `/collect/i` use JSON bodies with `Content-Type: text/plain;charset=UTF-8`; the Worker returned `415`, so application events never reached Segment or Mixpanel.
+- `/collect/m` was not routed and returned `404`; it is now safely acknowledged with `204` without entering the customer-event stream.
+- Bounded `text/plain` JSON parsing is enabled only for browser `/collect/*` and `/identify` handling. Authenticated `/server-collect` remains strict `application/json` and still returns `415` for text payloads.
+- Exact-event regressions cover `OS_bmi_screen`, identify, malformed JSON, unsupported media types, and metrics isolation.
+
 ## All-events delivery addendum
 
 - Authenticated identified non-conversion server event: synchronous Segment acknowledgement verified.
@@ -18,7 +25,7 @@ Status: **PASS for pull-request review and controlled deployment**.
 ## Provenance
 
 - CEO ZIP baseline Worker SHA-256: `2250affdf76f996d8e32ee772c248a0831d4aa7d11dd671efe6e8399e5e38139`.
-- Final compatibility Worker SHA-256: `6ec71ea2fee9826c83434d2eff6cc9eb39881ba542727fad234c2569be438c82`.
+- Final compatibility Worker SHA-256: recorded in `SHA256SUMS.txt` after release packaging.
 - CEO and packaged coordinator SHA-256: `d9aa4ce5ad33eb1000e33eb627745b75c7d5a6ee047c77368e1125fffcc7d0c0`.
 - Byte comparison confirms the packaged coordinator is unchanged.
 - Worker delta against the CEO baseline: 285 insertions and 45 deletions, confined to compatibility, delivery acknowledgement, destination ID handling, and release observability.
@@ -31,7 +38,7 @@ Status: **PASS for pull-request review and controlled deployment**.
 - New explicit regressions for `/collect/t`, `/collect/p`, `/collect/i`, fresh app bootstrap, legacy Webflow anonymous-owner bootstrap, exact `OS_intake_started`, synchronous Segment `503`, and Mixpanel-safe message IDs.
 - ConversionCoordinator: `13/13` atomicity, reservation, revocation, corruption, concurrency, and migration-compatibility tests.
 - Wrangler `4.110.0` dry-run.
-- Bundle: `530.76 KiB` uncompressed and `105.77 KiB` gzip.
+- Bundle: `531.97 KiB` uncompressed and `105.98 KiB` gzip.
 - Dry-run bindings: one Durable Object, three KV namespaces, the ad-click Queue, all production variables, and synchronous browser and server Segment delivery.
 - `npm audit`: zero known vulnerabilities.
 - GitHub Actions YAML parse.

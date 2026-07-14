@@ -1,6 +1,6 @@
 {
   "name": "eden-analytics-worker",
-  "version": "5.56.2",
+  "version": "5.56.3",
   "private": true,
   "type": "module",
   "scripts": {

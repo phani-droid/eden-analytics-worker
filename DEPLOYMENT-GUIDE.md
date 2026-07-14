@@ -169,7 +169,7 @@ The workflow:
 2. reruns all tests;
 3. builds a dry-run bundle;
 4. deploys one atomic Worker version;
-5. verifies version `5.56`, release revision `v556-phani-analytics-compat-20260715`, readiness, Segment secret presence, and synchronous browser delivery.
+5. verifies version `5.56`, release revision `v556-phani-browser-sdk-hotfix-20260715`, readiness, Segment secret presence, and synchronous browser delivery.
 
 Do not create a 1%/10% version split. v5.56 uses shared Durable Object, Queue, and KV state; the repository deploy intentionally promotes one version atomically.
 
@@ -188,7 +188,7 @@ Confirm:
 - `ok: true`;
 - `ready: true`;
 - `version: "5.56"`;
-- `release_revision: "v556-phani-analytics-compat-20260715"`;
+- `release_revision: "v556-phani-browser-sdk-hotfix-20260715"`;
 - `browser_segment_delivery_mode: "sync"`;
 - `segment_write_key_configured: true`.
 

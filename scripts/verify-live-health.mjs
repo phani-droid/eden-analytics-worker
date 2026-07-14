@@ -2,7 +2,7 @@
 import assert from "node:assert/strict";
 
 const url = process.argv[2] || "https://app.eden.health/eden-health-check";
-const expectedRevision = "v556-phani-analytics-compat-20260715";
+const expectedRevision = "v556-phani-browser-sdk-hotfix-20260715";
 
 let response;
 for (let attempt = 1; attempt <= 6; attempt += 1) {

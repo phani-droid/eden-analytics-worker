@@ -46,7 +46,6 @@ After deployment, `/eden-health-check` must report:
 - `ok: true`
 - `ready: true`
 - `version: 5.56`
-- `release_revision: v556-phani-all-events-delivery-20260715`
+- `release_revision: v556-phani-browser-sdk-hotfix-20260715`
 - `browser_segment_delivery_mode: sync`
 - `server_segment_delivery_mode: sync`
-

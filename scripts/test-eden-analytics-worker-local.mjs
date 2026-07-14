@@ -6948,10 +6948,16 @@ async function mutationEndpointsFailClosedAndBoundJsonBodies() {
     assert.equal((await worker.fetch(oversized, {}, makeCtx())).status, 413, "body cap must be byte-based, including multibyte input");
     const wrongType = new Request("https://collect.eden.health/collect", {
       method: "POST",
-      headers: { "Content-Type": "text/plain", "Origin": "https://app.eden.health" },
+      headers: { "Content-Type": "application/xml", "Origin": "https://app.eden.health" },
       body: "{}",
     });
-    assert.equal((await worker.fetch(wrongType, {}, makeCtx())).status, 415, "collector must reject non-JSON content types");
+    assert.equal((await worker.fetch(wrongType, {}, makeCtx())).status, 415, "collector must reject media types outside JSON and browser beacon JSON");
+    const malformedBeacon = new Request("https://collect.eden.health/collect", {
+      method: "POST",
+      headers: { "Content-Type": "text/plain;charset=UTF-8", "Origin": "https://app.eden.health" },
+      body: "not-json",
+    });
+    assert.equal((await worker.fetch(malformedBeacon, {}, makeCtx())).status, 400, "browser beacon media type must still contain valid bounded JSON");
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -7579,7 +7585,7 @@ async function signedBrowserCapabilityEnforcementContract() {
     assert.equal((await productionWorker.fetch(makeBrowserCollect(capabilityPair, {}, oversizedBody), baseEnv, makeCtx())).status, 413, "body cap still applies after capability authentication");
     const wrongType = new Request("https://collect.eden.health/collect", {
       method: "POST",
-      headers: { "Content-Type": "text/plain", Origin: "https://app.eden.health", Cookie: capabilityPair },
+      headers: { "Content-Type": "application/xml", Origin: "https://app.eden.health", Cookie: capabilityPair },
       body: "{}",
     });
     assert.equal((await productionWorker.fetch(wrongType, baseEnv, makeCtx())).status, 415);
@@ -11140,10 +11146,10 @@ async function appWebflowAliasesAndSynchronousDeliveryRemainCompatible() {
     GCLID_KV: kv,
     CONVERSION_COORDINATOR: new MockConversionCoordinatorNamespace(),
   };
-  const request = (path, body, cookie = "", origin = "https://app.eden.health") => new Request(`https://collect.eden.health${path}`, {
+  const request = (path, body, cookie = "", origin = "https://app.eden.health", contentType = "application/json") => new Request(`https://collect.eden.health${path}`, {
     method: "POST",
     headers: {
-      "Content-Type": "application/json",
+      "Content-Type": contentType,
       Origin: origin,
       "Sec-Fetch-Site": "same-site",
       ...(cookie ? { Cookie: cookie } : {}),
@@ -11180,6 +11186,31 @@ async function appWebflowAliasesAndSynchronousDeliveryRemainCompatible() {
     }, ownerCookies), env, makeCtx());
     assert.equal(identify.status, 200, "AnalyticsBrowser /collect/i must reach the guarded identify compatibility path");
     assert.equal((await identify.json()).stable_identity_accepted, false);
+
+    const beaconTrack = await productionWorker.fetch(request("/collect/t", {
+      type: "track",
+      event: "OS_bmi_screen",
+      messageId: "app-bmi-beacon-1",
+      properties: { description: "BMI screen mounted" },
+    }, ownerCookies, "https://app.eden.health", "text/plain;charset=UTF-8"), env, makeCtx());
+    assert.equal(beaconTrack.status, 200, "AnalyticsBrowser text/plain /collect/t beacon JSON must be accepted");
+    assert.equal(segmentCalls.at(-1).event, "OS_bmi_screen");
+
+    const beaconIdentify = await productionWorker.fetch(request("/collect/i", {
+      type: "identify",
+      userId: "browser-beacon-must-not-own-stable-id",
+      traits: { email: "must-not-forward-beacon@example.com" },
+    }, ownerCookies, "https://app.eden.health", "text/plain;charset=UTF-8"), env, makeCtx());
+    assert.equal(beaconIdentify.status, 200, "AnalyticsBrowser text/plain /collect/i beacon JSON must be accepted");
+    assert.equal((await beaconIdentify.json()).stable_identity_accepted, false);
+
+    const callsBeforeTelemetry = segmentCalls.length;
+    const metrics = await productionWorker.fetch(request("/collect/m", {
+      type: "delivery-metrics",
+      counters: [],
+    }, ownerCookies, "https://app.eden.health", "text/plain;charset=UTF-8"), env, makeCtx());
+    assert.equal(metrics.status, 204, "AnalyticsBrowser /collect/m telemetry must be acknowledged without becoming an event");
+    assert.equal(segmentCalls.length, callsBeforeTelemetry, "SDK telemetry must not enter the customer event stream");
 
     const legacyOnly = await productionWorker.fetch(request("/collect", {
       type: "track",
@@ -11252,6 +11283,16 @@ async function authenticatedServerEventsAreNeverSilentlyDropped() {
     }), env, makeCtx());
     assert.equal(identified.status, 200, "identified server lifecycle event must be delivered synchronously");
     assert.equal(segmentCalls.at(-1).event, "OS_order_status_changed");
+
+    const serverTextPlain = await productionWorker.fetch(new Request("https://app.eden.health/server-collect", {
+      method: "POST",
+      headers: {
+        "Content-Type": "text/plain;charset=UTF-8",
+        "X-Eden-Server-Secret": TEST_SERVER_API_SECRET,
+      },
+      body: JSON.stringify({ type: "track", event: "server_media_type_probe", userId: "customer-123" }),
+    }), env, makeCtx());
+    assert.equal(serverTextPlain.status, 415, "authenticated server collection must remain strict application/json");
 
     segmentStatus = 503;
     const failed = await productionWorker.fetch(request({
